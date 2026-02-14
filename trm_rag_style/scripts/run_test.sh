@@ -11,7 +11,7 @@ if [ -z "$CKPT" ]; then
   exit 1
 fi
 
-python -m trm_gnnrag_style.run \
+python -m trm_rag_style.run \
   --dataset "$DATASET" \
   --model_impl "$MODEL_IMPL" \
   --stage test \

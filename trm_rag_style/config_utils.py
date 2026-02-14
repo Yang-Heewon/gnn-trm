@@ -48,10 +48,10 @@ def apply_overrides(cfg: Dict, overrides):
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(description='GNN-RAG style orchestrator for TRM pipeline')
+    ap = argparse.ArgumentParser(description='TRM-RAG style orchestrator for TRM pipeline')
     ap.add_argument('--dataset', choices=['cwq', 'webqsp'], required=True)
     ap.add_argument('--stage', choices=['preprocess', 'embed', 'train', 'test', 'all'], default='all')
-    ap.add_argument('--config_dir', default='trm_gnnrag_style/configs')
+    ap.add_argument('--config_dir', default='trm_rag_style/configs')
     ap.add_argument('--model_impl', choices=['trm', 'trm_hier6'], default='trm_hier6')
     ap.add_argument('--embedding_model', default='intfloat/multilingual-e5-large')
     ap.add_argument('--ckpt', default='')
