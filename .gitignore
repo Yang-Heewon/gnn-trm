@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pt
+*.pth
+*.ckpt
+*.log
+*.npy
+processed/
+ckpt/
+emb/

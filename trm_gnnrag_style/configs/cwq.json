@@ -1,0 +1,7 @@
+{
+  "train_in": "/data2/workspace/heewon/논문작업/data/CWQ/train_split.jsonl",
+  "dev_in": "/data2/workspace/heewon/논문작업/data/CWQ/dev_split.jsonl",
+  "test_in": "",
+  "entities_txt": "/data2/workspace/heewon/논문작업/data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt",
+  "relations_txt": "/data2/workspace/heewon/논문작업/data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
+}

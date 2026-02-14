@@ -1,0 +1,7 @@
+{
+  "train_in": "/data2/workspace/heewon/논문작업/data/webqsp/train.json",
+  "dev_in": "/data2/workspace/heewon/논문작업/data/webqsp/dev.json",
+  "test_in": "",
+  "entities_txt": "/data2/workspace/heewon/논문작업/data/webqsp/entities.txt",
+  "relations_txt": "/data2/workspace/heewon/논문작업/data/webqsp/relations.txt"
+}

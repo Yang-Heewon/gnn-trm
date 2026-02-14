@@ -1,0 +1,40 @@
+{
+  "workspace_root": "/data2/workspace/heewon/논문작업",
+  "trm_root": "/data2/workspace/heewon/논문작업/TinyRecursiveModels",
+  "trm_tokenizer": "intfloat/multilingual-e5-large",
+  "emb_tag": "e5",
+
+  "max_steps": 4,
+  "max_paths": 4,
+  "mine_max_neighbors": 128,
+
+  "embed_batch_size": 64,
+  "embed_max_length": 128,
+  "embed_device": "cuda",
+
+  "batch_size": 8,
+  "epochs": 5,
+  "lr": 0.0001,
+  "num_workers": 4,
+  "max_q_len": 512,
+  "max_neighbors": 256,
+  "prune_keep": 64,
+  "prune_rand": 64,
+  "beam": 8,
+  "start_topk": 5,
+  "eval_limit": -1,
+  "debug_eval_n": 5,
+
+  "seq_len": 1024,
+  "hidden_size": 512,
+  "num_heads": 8,
+  "expansion": 4.0,
+  "H_cycles": 3,
+  "L_cycles": 6,
+  "L_layers": 2,
+  "puzzle_emb_len": 16,
+  "pos_encodings": "rope",
+  "forward_dtype": "float32",
+  "halt_max_steps": 16,
+  "halt_exploration_prob": 0.1
+}
