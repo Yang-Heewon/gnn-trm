@@ -17,11 +17,11 @@ pip install -r requirements.txt
 
 3. 데이터 다운로드 + 경로 정리 + 전처리
 ```bash
-DATASET=webqsp bash scripts/setup_and_preprocess.sh
+bash scripts/setup_and_preprocess.sh
 ```
-- `DATASET=cwq` 또는 `DATASET=all` 가능
+- 기본값은 `DATASET=all`이며 `CWQ -> WebQSP` 순서로 전처리합니다.
+- `DATASET=cwq` 또는 `DATASET=webqsp`로 단일 데이터셋만 처리할 수 있습니다.
 - 기본 Google Drive 파일 URL은 스크립트에 내장되어 있습니다.
-- `DATASET=all`일 때는 `CWQ -> WebQSP` 순서로 전처리합니다.
 
 4. 임베딩 생성
 ```bash
@@ -65,6 +65,8 @@ python -m trm_rag_style.run \
   --stage preprocess \
   --override max_steps=6 max_paths=8 mine_max_neighbors=256
 ```
+- 전처리 split 정책:
+`train`은 BFS로 relation-path를 채굴해 학습에 사용하고, `dev/test`는 endpoint 도달 평가(`Hit@1`, `F1`)용으로 path가 없어도 유지합니다.
 - CWQ 먼저, 이후 WebQSP를 같은 설정으로 전처리:
 ```bash
 MAX_STEPS=6 MAX_PATHS=8 MINE_MAX_NEIGHBORS=256 bash scripts/preprocess_cwq_then_webqsp.sh

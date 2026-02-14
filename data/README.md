@@ -39,6 +39,26 @@ DATASET=webqsp bash scripts/setup_and_preprocess.sh
 python -m trm_rag_style.run --dataset cwq --stage preprocess --override max_steps=6 max_paths=8 mine_max_neighbors=256
 ```
 
+## 전처리 정책 (요청 반영)
+- `train`: 질문 + 시작 엔티티(`entities`) + 서브그래프(`subgraph.tuples`)에서 BFS로 `valid_paths`를 채굴하고, relation 경로(`relation_paths`)를 학습 신호로 사용합니다.
+- `dev/test`: 시작 엔티티에서 정답 엔티티(`answers_cid`) 도달 과제를 위해 샘플을 유지합니다. 이 split은 path가 없어도 drop하지 않으며, 평가는 endpoint 도달 기준으로 `Hit@1`, `F1`을 사용합니다.
+- BFS depth는 `max_steps`, 경로 수는 `max_paths`, 이웃 제한은 `mine_max_neighbors`로 제어합니다.
+
+## 튜플 숫자 매핑 규칙
+- 예시 튜플: `[303793, 2327, 303791]`
+- 첫 번째/세 번째 숫자(주어/목적어): `entities.txt`의 줄 인덱스입니다. 해당 줄의 엔티티 ID를 키로 `data/data/entities_names.json`에서 이름으로 매핑할 수 있습니다.
+- 두 번째 숫자(관계): `relations.txt`의 줄 인덱스이며, 해당 줄 텍스트가 relation 문자열입니다.
+
+검증 도구:
+```bash
+python scripts/inspect_subgraph_mapping.py \
+  --input data/CWQ/train_split.jsonl \
+  --entities_txt data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt \
+  --relations_txt data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt \
+  --entity_names_json data/data/entities_names.json \
+  --index 0 --show_tuples 10
+```
+
 ## 기대 경로
 WebQSP:
 - `data/webqsp/train.json`

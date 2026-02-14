@@ -85,6 +85,7 @@ def run(cfg):
     train_out = os.path.join(cfg['processed_dir'], 'train.jsonl')
     dev_out = os.path.join(cfg['processed_dir'], 'dev.jsonl')
 
+    # Train: relation supervision from BFS-mined paths.
     tr = preprocess_split(
         dataset=cfg['dataset'],
         input_path=cfg['train_in'],
@@ -93,7 +94,11 @@ def run(cfg):
         max_steps=int(cfg['max_steps']),
         max_paths=int(cfg['max_paths']),
         max_neighbors=int(cfg['mine_max_neighbors']),
+        mine_paths=True,
+        require_valid_paths=True,
     )
+    # Dev/Test: keep endpoint-traversal tasks even when no mined path exists.
+    # Evaluation uses start entities + subgraph to reach gold answer entities (Hit@1/F1).
     dv = preprocess_split(
         dataset=cfg['dataset'],
         input_path=cfg['dev_in'],
@@ -102,6 +107,8 @@ def run(cfg):
         max_steps=int(cfg['max_steps']),
         max_paths=int(cfg['max_paths']),
         max_neighbors=int(cfg['mine_max_neighbors']),
+        mine_paths=False,
+        require_valid_paths=False,
     )
 
     out.update({'train': tr, 'dev': dv})
@@ -115,6 +122,8 @@ def run(cfg):
             max_steps=int(cfg['max_steps']),
             max_paths=int(cfg['max_paths']),
             max_neighbors=int(cfg['mine_max_neighbors']),
+            mine_paths=False,
+            require_valid_paths=False,
         )
         out['test'] = te
 

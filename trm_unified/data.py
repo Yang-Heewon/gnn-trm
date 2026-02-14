@@ -133,6 +133,7 @@ def _normalize_cwq(
     max_steps: int,
     max_paths: int,
     max_neighbors: int,
+    mine_paths: bool = True,
 ) -> dict:
     entities = [int(x) for x in ex.get('entities', []) if isinstance(x, int)]
     answers = ex.get('answers', [])
@@ -146,7 +147,7 @@ def _normalize_cwq(
             kb_id = a.get('kb_id') if isinstance(a, dict) else None
             if kb_id in kb2idx:
                 answers_cid.append(int(kb2idx[kb_id]))
-    if (not valid_paths) and tuples and entities and answers_cid:
+    if mine_paths and (not valid_paths) and tuples and entities and answers_cid:
         valid_paths = mine_valid_paths(
             tuples=tuples,
             start_entities=entities,
@@ -155,6 +156,8 @@ def _normalize_cwq(
             max_paths=max_paths,
             max_neighbors=max_neighbors,
         )
+    if not mine_paths:
+        valid_paths = []
 
     relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
 
@@ -177,7 +180,14 @@ def _normalize_cwq(
     return out
 
 
-def _normalize_webqsp(ex: dict, kb2idx: Dict[str, int], max_steps: int, max_paths: int, max_neighbors: int) -> dict:
+def _normalize_webqsp(
+    ex: dict,
+    kb2idx: Dict[str, int],
+    max_steps: int,
+    max_paths: int,
+    max_neighbors: int,
+    mine_paths: bool = True,
+) -> dict:
     answers = ex.get('answers', [])
     answers_cid = []
     for a in answers:
@@ -187,14 +197,16 @@ def _normalize_webqsp(ex: dict, kb2idx: Dict[str, int], max_steps: int, max_path
 
     entities = [int(x) for x in ex.get('entities', []) if isinstance(x, int)]
     tuples = ex.get('subgraph', {}).get('tuples', [])
-    valid_paths = mine_valid_paths(
-        tuples=tuples,
-        start_entities=entities,
-        goal_entities=answers_cid,
-        max_steps=max_steps,
-        max_paths=max_paths,
-        max_neighbors=max_neighbors,
-    )
+    valid_paths = []
+    if mine_paths:
+        valid_paths = mine_valid_paths(
+            tuples=tuples,
+            start_entities=entities,
+            goal_entities=answers_cid,
+            max_steps=max_steps,
+            max_paths=max_paths,
+            max_neighbors=max_neighbors,
+        )
 
     relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
 
@@ -218,6 +230,8 @@ def preprocess_split(
     max_steps: int = 4,
     max_paths: int = 4,
     max_neighbors: int = 128,
+    mine_paths: bool = True,
+    require_valid_paths: bool = True,
 ):
     dataset = dataset.lower()
     kb2idx = load_kb_map(entities_txt)
@@ -228,13 +242,13 @@ def preprocess_split(
         for ex in iter_json_records(input_path):
             total += 1
             if dataset == 'cwq':
-                obj = _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors)
+                obj = _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
             elif dataset == 'webqsp':
-                obj = _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors)
+                obj = _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
             else:
                 raise ValueError(f'Unsupported dataset: {dataset}')
 
-            if not obj['valid_paths']:
+            if require_valid_paths and not obj['valid_paths']:
                 continue
             w.write(json.dumps(obj, ensure_ascii=False) + '\n')
             kept += 1
