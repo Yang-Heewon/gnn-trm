@@ -9,21 +9,17 @@ TRM 기반 그래프 경로 추론 파이프라인입니다.
 pip install -r requirements.txt
 ```
 
-2. TRM 모듈 확인
-- 이 저장소에는 로컬에서 사용 중인 TRM 파이썬 모듈이 `TinyRecursiveModels/`로 함께 포함되어 있습니다.
-- 별도 TRM 저장소를 추가로 clone하지 않아도 됩니다.
-
-3. 데이터 배치
-- `data/webqsp/*` 또는 `data/CWQ/*` 경로에 데이터 파일을 둡니다.
-- 기본 경로는 `trm_rag_style/configs/*.json`에 정의되어 있으며 모두 저장소 루트 기준 상대경로입니다.
-
-4. 실행
+2. 데이터 다운로드 + 전처리
 ```bash
-DATASET=webqsp bash trm_rag_style/scripts/run_preprocess.sh
-DATASET=webqsp bash trm_rag_style/scripts/run_embed.sh
+DATASET=webqsp bash scripts/setup_and_preprocess.sh
+```
+
+3. 학습
+```bash
 DATASET=webqsp MODEL_IMPL=trm_hier6 bash trm_rag_style/scripts/run_train.sh
 ```
 
 ## Notes
-- 기존 엔트리포인트 `python -m trm_gnnrag_style.run`는 호환 alias로 유지됩니다.
-- `TRM_ROOT` 환경변수로 TinyRecursiveModels 경로를 재지정할 수 있습니다.
+- TRM 모듈은 저장소의 `TinyRecursiveModels/`(로컬 사용본)를 사용합니다.
+- 데이터 자동 설정 상세: `data/README.md`
+- 필요 시 `TRM_ROOT` 환경변수로 TRM 모듈 경로를 재지정할 수 있습니다.
