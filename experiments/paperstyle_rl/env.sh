@@ -25,9 +25,11 @@ export EPOCHS_PHASE2="${EPOCHS_PHASE2:-20}"
 # Distributed settings
 export TORCHRUN="${TORCHRUN:-/data2/workspace/heewon/anaconda3/envs/taiLab/bin/torchrun}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
+export NPROC_PER_NODE_PHASE2="${NPROC_PER_NODE_PHASE2:-1}"
 export MASTER_PORT="${MASTER_PORT:-29631}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export DDP_FIND_UNUSED="${DDP_FIND_UNUSED:-true}"
+export DDP_TIMEOUT_MINUTES="${DDP_TIMEOUT_MINUTES:-60}"
 
 # W&B settings
 export WANDB_MODE="${WANDB_MODE:-online}"

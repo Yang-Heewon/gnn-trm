@@ -3,6 +3,7 @@ import math
 import os
 import re
 import json
+from datetime import timedelta
 from collections import deque
 from typing import Dict, List, Optional
 
@@ -329,7 +330,12 @@ def make_collate(
 
 def _setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
+        timeout_min = int(os.environ.get("DDP_TIMEOUT_MINUTES", "30"))
+        timeout_min = max(1, timeout_min)
+        dist.init_process_group(
+            backend='nccl' if torch.cuda.is_available() else 'gloo',
+            timeout=timedelta(minutes=timeout_min),
+        )
         rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
         world_size = int(os.environ['WORLD_SIZE'])

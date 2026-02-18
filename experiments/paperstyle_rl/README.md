@@ -31,6 +31,8 @@ bash experiments/paperstyle_rl/03_train_phase2_rl.sh
 - `BATCH_SIZE` (default: `6`)
 - `LR` (default: `1e-4`)
 - `WANDB_ENTITY` (default: `heewon6205-chung-ang-university`)
+- `NPROC_PER_NODE` (phase1 default: `3`)
+- `NPROC_PER_NODE_PHASE2` (phase2 default: `1`, RL 안정성용)
 - `CKPT_DIR_PHASE1`, `CKPT_DIR_PHASE2`
 
 예시:
