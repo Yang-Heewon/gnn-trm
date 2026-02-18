@@ -107,6 +107,13 @@ S2_MAX_STEPS_GRID=2,3 S2_BEAM_GRID=8,16,24 EPOCHS=8 BATCH_SIZE=6 \
 bash scripts/run_cwq_experiment_suite.sh
 ```
 
+## 전용 프리셋 폴더
+`논문작업` 스타일 재현 후 RL phase2를 이어서 돌리는 전용 실행 폴더:
+```bash
+cd /data2/workspace/heewon/GRAPH-TRAVERSE
+bash experiments/paperstyle_rl/run_all.sh
+```
+
 ## 한 줄 실행 예시
 ```bash
 python -m trm_agent.run --dataset webqsp --stage all --model_impl trm_hier6
