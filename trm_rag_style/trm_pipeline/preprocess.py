@@ -100,6 +100,8 @@ def run(cfg):
         mine_paths=True,
         require_valid_paths=True,
         preprocess_workers=pp_workers,
+        path_policy=str(cfg.get('train_path_policy', 'all')),
+        shortest_k=int(cfg.get('train_shortest_k', 1)),
         progress_desc=f"{cfg['dataset']}:train",
     )
     # Dev/Test: keep endpoint-traversal tasks even when no mined path exists.

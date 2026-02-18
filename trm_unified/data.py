@@ -108,6 +108,31 @@ def mine_valid_paths(
     return found
 
 
+def _apply_path_policy(valid_paths, path_policy: str = "all", shortest_k: int = 1):
+    paths = [p for p in valid_paths if isinstance(p, list) and p]
+    if not paths:
+        return []
+
+    policy = str(path_policy or "all").strip().lower()
+    if policy in {"all", "keep_all"}:
+        return paths
+
+    if policy in {"shortest_only", "shortest"}:
+        min_len = min(len(p) for p in paths)
+        for p in paths:
+            if len(p) == min_len:
+                return [p]
+        return [paths[0]]
+
+    if policy in {"shortest_k", "k_shortest"}:
+        k = max(1, int(shortest_k))
+        # Stable tiebreak by original order.
+        ranked = sorted(enumerate(paths), key=lambda x: (len(x[1]), x[0]))
+        return [p for _, p in ranked[:k]]
+
+    return paths
+
+
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -140,6 +165,8 @@ def _normalize_cwq(
     max_paths: int,
     max_neighbors: int,
     mine_paths: bool = True,
+    path_policy: str = "all",
+    shortest_k: int = 1,
 ) -> dict:
     entities = [int(x) for x in ex.get('entities', []) if isinstance(x, int)]
     answers = ex.get('answers', [])
@@ -165,8 +192,6 @@ def _normalize_cwq(
     if not mine_paths:
         valid_paths = []
 
-    relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
-
     out = {
         'orig_id': ex.get('orig_id', ex.get('id', '')),
         'question': ex.get('question', ''),
@@ -175,14 +200,20 @@ def _normalize_cwq(
         'answers': answers,
         'subgraph': {'tuples': tuples},
         'valid_paths': valid_paths,
-        'relation_paths': relation_paths,
+        'relation_paths': [],
     }
     if max_steps > 0 and out['valid_paths']:
         out['valid_paths'] = [p[:max_steps] for p in out['valid_paths']]
-        out['relation_paths'] = [
-            [int(step[1]) for step in p if isinstance(step, list) and len(step) == 3]
-            for p in out['valid_paths']
-        ]
+    if mine_paths and out['valid_paths']:
+        out['valid_paths'] = _apply_path_policy(
+            out['valid_paths'],
+            path_policy=path_policy,
+            shortest_k=shortest_k,
+        )
+    out['relation_paths'] = [
+        [int(step[1]) for step in p if isinstance(step, list) and len(step) == 3]
+        for p in out['valid_paths']
+    ]
     return out
 
 
@@ -193,6 +224,8 @@ def _normalize_webqsp(
     max_paths: int,
     max_neighbors: int,
     mine_paths: bool = True,
+    path_policy: str = "all",
+    shortest_k: int = 1,
 ) -> dict:
     answers = ex.get('answers', [])
     answers_cid = []
@@ -214,6 +247,14 @@ def _normalize_webqsp(
             max_neighbors=max_neighbors,
         )
 
+    if max_steps > 0 and valid_paths:
+        valid_paths = [p[:max_steps] for p in valid_paths]
+    if mine_paths and valid_paths:
+        valid_paths = _apply_path_policy(
+            valid_paths,
+            path_policy=path_policy,
+            shortest_k=shortest_k,
+        )
     relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
 
     return {
@@ -239,6 +280,8 @@ def preprocess_split(
     mine_paths: bool = True,
     require_valid_paths: bool = True,
     preprocess_workers: int = 1,
+    path_policy: str = "all",
+    shortest_k: int = 1,
     progress_desc: str = "preprocess",
 ):
     dataset = dataset.lower()
@@ -253,7 +296,10 @@ def preprocess_split(
         if workers == 1:
             for ex in iter_json_records(input_path):
                 total += 1
-                obj = _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths)
+                obj = _normalize_one(
+                    ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths,
+                    path_policy=path_policy, shortest_k=shortest_k
+                )
                 if require_valid_paths and not obj['valid_paths']:
                     pbar.update(1)
                     continue
@@ -265,7 +311,7 @@ def preprocess_split(
                 with mp.Pool(
                     processes=workers,
                     initializer=_init_preprocess_worker,
-                    initargs=(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths),
+                    initargs=(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths, path_policy, shortest_k),
                 ) as pool:
                     for obj in pool.imap(_normalize_one_mp, iter_json_records(input_path), chunksize=32):
                         total += 1
@@ -279,7 +325,10 @@ def preprocess_split(
                 print(f"[warn] multiprocessing disabled ({e}); fallback to single worker.")
                 for ex in iter_json_records(input_path):
                     total += 1
-                    obj = _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths)
+                    obj = _normalize_one(
+                        ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths,
+                        path_policy=path_policy, shortest_k=shortest_k
+                    )
                     if require_valid_paths and not obj['valid_paths']:
                         pbar.update(1)
                         continue
@@ -290,15 +339,21 @@ def preprocess_split(
     return {'total': total, 'kept': kept, 'output': output_path}
 
 
-def _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths):
+def _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths, path_policy="all", shortest_k=1):
     if dataset == 'cwq':
-        return _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
+        return _normalize_cwq(
+            ex, kb2idx, max_steps, max_paths, max_neighbors,
+            mine_paths=mine_paths, path_policy=path_policy, shortest_k=shortest_k
+        )
     if dataset == 'webqsp':
-        return _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
+        return _normalize_webqsp(
+            ex, kb2idx, max_steps, max_paths, max_neighbors,
+            mine_paths=mine_paths, path_policy=path_policy, shortest_k=shortest_k
+        )
     raise ValueError(f'Unsupported dataset: {dataset}')
 
 
-def _init_preprocess_worker(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths):
+def _init_preprocess_worker(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths, path_policy, shortest_k):
     global _PP_CFG
     _PP_CFG = {
         'dataset': dataset,
@@ -307,6 +362,8 @@ def _init_preprocess_worker(dataset, kb2idx, max_steps, max_paths, max_neighbors
         'max_paths': max_paths,
         'max_neighbors': max_neighbors,
         'mine_paths': mine_paths,
+        'path_policy': path_policy,
+        'shortest_k': shortest_k,
     }
 
 
@@ -319,6 +376,8 @@ def _normalize_one_mp(ex):
         max_paths=_PP_CFG['max_paths'],
         max_neighbors=_PP_CFG['max_neighbors'],
         mine_paths=_PP_CFG['mine_paths'],
+        path_policy=_PP_CFG['path_policy'],
+        shortest_k=_PP_CFG['shortest_k'],
     )
 
 

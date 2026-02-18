@@ -31,6 +31,7 @@ def normalize_config_paths(cfg):
         'dev_in',
         'test_in',
         'entities_txt',
+        'entity_names_json',
         'relations_txt',
         'processed_dir',
         'emb_dir',

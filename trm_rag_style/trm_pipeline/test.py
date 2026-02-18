@@ -3,12 +3,19 @@ from types import SimpleNamespace
 from trm_unified.train_core import test as run_test
 
 
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def run(cfg):
     args = SimpleNamespace(
         trm_root=cfg['trm_root'],
         model_impl=cfg['model_impl'],
         ckpt=cfg['ckpt'],
         entities_txt=cfg['entities_txt'],
+        entity_names_json=cfg.get('entity_names_json', ''),
         relations_txt=cfg['relations_txt'],
         entity_emb_npy=cfg['entity_emb_npy'],
         relation_emb_npy=cfg['relation_emb_npy'],
@@ -22,8 +29,17 @@ def run(cfg):
         prune_keep=int(cfg.get('prune_keep', 64)),
         beam=int(cfg.get('beam', 5)),
         start_topk=int(cfg.get('start_topk', 5)),
+        eval_max_steps=int(cfg.get('eval_max_steps', cfg.get('max_steps', 4))),
+        eval_max_neighbors=int(cfg.get('eval_max_neighbors', cfg.get('max_neighbors', 256))),
+        eval_prune_keep=int(cfg.get('eval_prune_keep', cfg.get('prune_keep', 64))),
+        eval_beam=int(cfg.get('eval_beam', cfg.get('beam', 5))),
+        eval_start_topk=int(cfg.get('eval_start_topk', cfg.get('start_topk', 5))),
+        eval_no_cycle=_as_bool(cfg.get('eval_no_cycle', False)),
         eval_limit=int(cfg.get('eval_limit', -1)),
         debug_eval_n=int(cfg.get('debug_eval_n', 5)),
+        eval_pred_topk=int(cfg.get('eval_pred_topk', 1)),
+        eval_use_halt=_as_bool(cfg.get('eval_use_halt', False)),
+        eval_min_hops_before_stop=int(cfg.get('eval_min_hops_before_stop', 1)),
         seq_len=int(cfg['seq_len']),
         hidden_size=int(cfg['hidden_size']),
         num_heads=int(cfg['num_heads']),

@@ -28,6 +28,11 @@ bash scripts/setup_and_preprocess.sh
 - 기본값은 `DATASET=all`이며 `CWQ -> WebQSP` 순서로 전처리합니다.
 - `DATASET=cwq` 또는 `DATASET=webqsp`로 단일 데이터셋만 처리할 수 있습니다.
 - 기본 Google Drive 파일 URL은 스크립트에 내장되어 있습니다.
+- 기본 학습 경로 정책은 `train_path_policy=shortest_only` 입니다(질문당 최단 경로 1개).
+- 필요 시 최단 k개 경로:
+```bash
+TRAIN_PATH_POLICY=shortest_k TRAIN_SHORTEST_K=3 bash scripts/setup_and_preprocess.sh
+```
 
 4. 임베딩 생성
 ```bash
@@ -39,10 +44,57 @@ DATASET=webqsp bash trm_agent/scripts/run_embed.sh
 DATASET=webqsp MODEL_IMPL=trm_hier6 bash trm_agent/scripts/run_train.sh
 ```
 - `MODEL_IMPL=trm` 또는 `MODEL_IMPL=trm_hier6`
+- 기본으로 `eval_no_cycle=true`(재방문 금지)와 `endpoint_aux_weight=0.2`가 적용됩니다.
+- 기본 dev 평가는 `200개`, `2epoch마다`, `ep2부터` 수행됩니다.
+- 학습 시작 전에 `OracleDiag`가 출력됩니다.
+  - `answer_in_subgraph`: 정답 엔티티가 서브그래프에 존재하는 비율
+  - `reachable@K`: 현재 `eval_max_steps=K`에서 시작 엔티티로 정답 도달 가능한 비율
+  - `reachable_any`: hop 제한 없이 도달 가능한 비율
+- 탐색 튜닝 예시:
+```bash
+DATASET=cwq MODEL_IMPL=trm_hier6 \
+EVAL_NO_CYCLE=true EVAL_MAX_STEPS=3 EVAL_BEAM=16 EVAL_START_TOPK=5 \
+bash trm_agent/scripts/run_train.sh
+```
+- OracleDiag 임계치 미만이면 학습을 강제 중단하려면:
+```bash
+DATASET=cwq MODEL_IMPL=trm_hier6 \
+ORACLE_DIAG_FAIL_THRESHOLD=0.30 \
+bash trm_agent/scripts/run_train.sh
+```
+- OracleDiag만 먼저 보고 싶으면:
+```bash
+DATASET=cwq MODEL_IMPL=trm_hier6 \
+ORACLE_DIAG_ONLY=true ORACLE_DIAG_LIMIT=-1 \
+bash trm_agent/scripts/run_train.sh
+```
 
 6. 테스트
 ```bash
 DATASET=webqsp MODEL_IMPL=trm_hier6 CKPT=/path/to/model_ep1.pt bash trm_agent/scripts/run_test.sh
+```
+- 전체 test 1회 + no-cycle 평가 예시:
+```bash
+DATASET=cwq MODEL_IMPL=trm_hier6 CKPT=/path/to/model_ep11.pt \
+EVAL_LIMIT=-1 EVAL_NO_CYCLE=true EVAL_MAX_STEPS=3 EVAL_BEAM=16 \
+bash trm_agent/scripts/run_test.sh
+```
+
+## 실험 자동화
+추천 ablation/tuning 순서(4개 core ablation -> stage2 탐색 -> shortest-k 비교)를 한 번에 실행:
+```bash
+cd /data2/workspace/heewon/GRAPH-TRAVERSE
+CUDA_VISIBLE_DEVICES=0,1,2 \
+WANDB_MODE=online WANDB_PROJECT=graph-traverse WANDB_ENTITY=heewon6205-chung-ang-university \
+bash scripts/run_cwq_experiment_suite.sh
+```
+
+- 결과: `trm_agent/experiments/cwq_suite_*/results.csv`
+- 기본 stage2 grid: `eval_max_steps in {2,3,4}`, `eval_beam in {8,16,32}`
+- 커스텀 grid 예시:
+```bash
+S2_MAX_STEPS_GRID=2,3 S2_BEAM_GRID=8,16,24 EPOCHS=8 BATCH_SIZE=6 \
+bash scripts/run_cwq_experiment_suite.sh
 ```
 
 ## 한 줄 실행 예시
