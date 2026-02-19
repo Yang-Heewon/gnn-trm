@@ -230,10 +230,9 @@ def build_embeddings(
         rel_texts = [process_relation_name_gnn_exact(rid) for rid in rel_ids]
         if (embed_backend or "auto").strip().lower() == "auto":
             embed_backend = "sentence_transformers"
-        if not query_prefix:
-            query_prefix = ""
-        if not passage_prefix:
-            passage_prefix = ""
+        # Force exact GNN-RAG gnn behavior: no query/passage prefixes.
+        query_prefix = ""
+        passage_prefix = ""
     elif gnn_style:
         ent_ids = load_id_list(entities_txt)
         rel_ids = load_id_list(relations_txt)

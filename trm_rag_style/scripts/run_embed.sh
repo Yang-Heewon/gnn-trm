@@ -44,10 +44,10 @@ fi
 if [ -n "$EMBED_BACKEND" ]; then
   OVR+=(embed_backend="$EMBED_BACKEND")
 fi
-if [ -n "$EMBED_QUERY_PREFIX" ]; then
+if [ -n "$EMBED_QUERY_PREFIX" ] || [ "$EMBED_STYLE" = "gnn_exact" ] || [ "$EMBED_STYLE" = "gnn-rag-gnn" ] || [ "$EMBED_STYLE" = "gnn_rag_gnn" ] || [ "$EMBED_STYLE" = "gnn_rag_gnn_exact" ] || [ "$EMBED_STYLE" = "gnn_gnn_exact" ]; then
   OVR+=(embed_query_prefix="$EMBED_QUERY_PREFIX")
 fi
-if [ -n "$EMBED_PASSAGE_PREFIX" ]; then
+if [ -n "$EMBED_PASSAGE_PREFIX" ] || [ "$EMBED_STYLE" = "gnn_exact" ] || [ "$EMBED_STYLE" = "gnn-rag-gnn" ] || [ "$EMBED_STYLE" = "gnn_rag_gnn" ] || [ "$EMBED_STYLE" = "gnn_rag_gnn_exact" ] || [ "$EMBED_STYLE" = "gnn_gnn_exact" ]; then
   OVR+=(embed_passage_prefix="$EMBED_PASSAGE_PREFIX")
 fi
 if [ -n "$ENTITY_NAMES_JSON" ]; then
