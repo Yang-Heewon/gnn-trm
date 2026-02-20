@@ -6,89 +6,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/portable_env.sh"
 PYTHON_BIN="$(require_python_bin)"
+
 DATA_DIR="$REPO_ROOT/data"
-TMP_DIR="$DATA_DIR/.downloads"
+mkdir -p "$DATA_DIR" "$DATA_DIR/.downloads"
 
-mkdir -p "$DATA_DIR" "$TMP_DIR" "$DATA_DIR/webqsp" "$DATA_DIR/CWQ/embeddings_output/CWQ/e5"
-
-GDRIVE_FILE_URL="${GDRIVE_FILE_URL:-https://drive.google.com/file/d/13DduGb1C-O6udi744WxNVnOVDJ6122JG/view?usp=sharing}"
-GDRIVE_FOLDER_URL="${GDRIVE_FOLDER_URL:-}"
-GDRIVE_FILE_OUT="${GDRIVE_FILE_OUT:-$TMP_DIR/gdrive_bundle.zip}"
-SKIP_GDRIVE="${SKIP_GDRIVE:-0}"
 TARGET_DATASET="$(echo "${DATASET:-all}" | tr '[:upper:]' '[:lower:]')"
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-run_gdown() {
-  if have_cmd gdown; then
-    gdown "$@"
-  else
-    $PYTHON_BIN -m gdown "$@"
-  fi
-}
-
-require_tool() {
-  local t="$1"
-  have_cmd "$t" || { echo "[err] missing tool: $t"; exit 1; }
-}
-
-download_file() {
-  local url="$1" out="$2"
-  [ -z "$url" ] && return 0
-  if [ -f "$out" ]; then
-    echo "[skip] exists: $out"
-    return 0
-  fi
-  mkdir -p "$(dirname "$out")"
-  echo "[dl] $url -> $out"
-  if have_cmd curl; then
-    curl -L --fail --retry 3 "$url" -o "$out"
-  elif have_cmd wget; then
-    wget -O "$out" "$url"
-  else
-    echo "[err] curl/wget not found"
-    exit 1
-  fi
-}
-
-extract_if_archive() {
-  local path="$1" target="$2"
-  case "$path" in
-    *.zip) require_tool unzip; unzip -o "$path" -d "$target" >/dev/null ;;
-    *.tar) tar -xf "$path" -C "$target" ;;
-    *.tar.gz|*.tgz) tar -xzf "$path" -C "$target" ;;
-    *) return 1 ;;
-  esac
-  return 0
-}
-
-copy_first_match() {
-  local target="$1"
-  shift
-  [ -f "$target" ] && { echo "[skip] exists: $target"; return 0; }
-
-  local found=""
-  for pat in "$@"; do
-    if [[ "$pat" == */* ]]; then
-      found="$(find "$DATA_DIR" "$TMP_DIR" -type f -ipath "$pat" 2>/dev/null | head -n 1 || true)"
-    else
-      found="$(find "$DATA_DIR" "$TMP_DIR" -type f -iname "$pat" 2>/dev/null | head -n 1 || true)"
-    fi
-    if [ -n "$found" ]; then
-      break
-    fi
-  done
-
-  if [ -z "$found" ]; then
-    echo "[miss] could not find source for $target"
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$target")"
-  cp -f "$found" "$target"
-  echo "[map] $found -> $target"
-  return 0
-}
+DATA_SOURCE="$(echo "${DATA_SOURCE:-rog_hf}" | tr '[:upper:]' '[:lower:]')"
+ROG_CWQ_DATASET="${ROG_CWQ_DATASET:-rmanluo/RoG-cwq}"
+ROG_WEBQSP_DATASET="${ROG_WEBQSP_DATASET:-rmanluo/RoG-webqsp}"
+HF_CACHE_DIR="${HF_CACHE_DIR:-}"
 
 require_path() {
   local p="$1"
@@ -100,99 +26,46 @@ require_path() {
   return 0
 }
 
-# Optional direct URLs
-WEBQSP_URL="${WEBQSP_URL:-}"
-CWQ_URL="${CWQ_URL:-}"
-WEBQSP_TRAIN_URL="${WEBQSP_TRAIN_URL:-}"
-WEBQSP_DEV_URL="${WEBQSP_DEV_URL:-}"
-WEBQSP_ENTITIES_URL="${WEBQSP_ENTITIES_URL:-}"
-WEBQSP_RELATIONS_URL="${WEBQSP_RELATIONS_URL:-}"
-CWQ_TRAIN_URL="${CWQ_TRAIN_URL:-}"
-CWQ_DEV_URL="${CWQ_DEV_URL:-}"
-CWQ_ENTITY_IDS_URL="${CWQ_ENTITY_IDS_URL:-}"
-CWQ_RELATION_IDS_URL="${CWQ_RELATION_IDS_URL:-}"
-
-# 1) Google Drive folder download (default on)
-if [ "$SKIP_GDRIVE" != "1" ] && [ -n "$GDRIVE_FILE_URL$GDRIVE_FOLDER_URL" ]; then
-  if ! have_cmd gdown && ! $PYTHON_BIN -m gdown --help >/dev/null 2>&1; then
-    echo "[err] gdown not found. Install with: pip install gdown"
-    exit 1
-  fi
-  if [ -n "$GDRIVE_FILE_URL" ]; then
-    if [ -f "$GDRIVE_FILE_OUT" ]; then
-      echo "[skip] exists: $GDRIVE_FILE_OUT"
-    else
-      echo "[dl] gdrive file -> $GDRIVE_FILE_OUT"
-      run_gdown --fuzzy "$GDRIVE_FILE_URL" -O "$GDRIVE_FILE_OUT"
-    fi
-    extract_if_archive "$GDRIVE_FILE_OUT" "$DATA_DIR" || true
-  fi
-  if [ -n "$GDRIVE_FOLDER_URL" ]; then
-    GDRIVE_DIR="$TMP_DIR/gdrive_folder"
-    mkdir -p "$GDRIVE_DIR"
-    echo "[dl] gdrive folder -> $GDRIVE_DIR"
-    run_gdown --folder --fuzzy "$GDRIVE_FOLDER_URL" -O "$GDRIVE_DIR"
-  fi
+if [ "$DATA_SOURCE" != "rog_hf" ] && [ "$DATA_SOURCE" != "hf_rog" ] && [ "$DATA_SOURCE" != "rog" ]; then
+  echo "[err] this pipeline now supports only RoG HF data source."
+  echo "      set DATA_SOURCE=rog_hf"
+  exit 2
 fi
 
-# 2) Optional bundle download/extract via URL
-if [ -n "$WEBQSP_URL" ]; then
-  webqsp_bundle="$TMP_DIR/$(basename "$WEBQSP_URL")"
-  download_file "$WEBQSP_URL" "$webqsp_bundle"
-  extract_if_archive "$webqsp_bundle" "$DATA_DIR" || true
+echo "[step] preparing RoG datasets from Hugging Face"
+PREP_ARGS=(
+  --dataset "$TARGET_DATASET"
+  --cwq_name "$ROG_CWQ_DATASET"
+  --webqsp_name "$ROG_WEBQSP_DATASET"
+  --out_root "$REPO_ROOT"
+)
+if [ -n "$HF_CACHE_DIR" ]; then
+  PREP_ARGS+=(--cache_dir "$HF_CACHE_DIR")
 fi
-if [ -n "$CWQ_URL" ]; then
-  cwq_bundle="$TMP_DIR/$(basename "$CWQ_URL")"
-  download_file "$CWQ_URL" "$cwq_bundle"
-  extract_if_archive "$cwq_bundle" "$DATA_DIR" || true
-fi
+"$PYTHON_BIN" scripts/prepare_rog_hf_data.py "${PREP_ARGS[@]}"
 
-# 3) Optional per-file direct URLs
-[ -n "$WEBQSP_TRAIN_URL" ] && download_file "$WEBQSP_TRAIN_URL" "$DATA_DIR/webqsp/train.json"
-[ -n "$WEBQSP_DEV_URL" ] && download_file "$WEBQSP_DEV_URL" "$DATA_DIR/webqsp/dev.json"
-[ -n "$WEBQSP_ENTITIES_URL" ] && download_file "$WEBQSP_ENTITIES_URL" "$DATA_DIR/webqsp/entities.txt"
-[ -n "$WEBQSP_RELATIONS_URL" ] && download_file "$WEBQSP_RELATIONS_URL" "$DATA_DIR/webqsp/relations.txt"
-
-[ -n "$CWQ_TRAIN_URL" ] && download_file "$CWQ_TRAIN_URL" "$DATA_DIR/CWQ/train_split.jsonl"
-[ -n "$CWQ_DEV_URL" ] && download_file "$CWQ_DEV_URL" "$DATA_DIR/CWQ/dev_split.jsonl"
-[ -n "$CWQ_ENTITY_IDS_URL" ] && download_file "$CWQ_ENTITY_IDS_URL" "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt"
-[ -n "$CWQ_RELATION_IDS_URL" ] && download_file "$CWQ_RELATION_IDS_URL" "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
-
-# 4) Auto-map from downloaded folder content
-if [ "$TARGET_DATASET" = "webqsp" ] || [ "$TARGET_DATASET" = "all" ]; then
-  copy_first_match "$DATA_DIR/webqsp/train.json" "*/webqsp/train.json" "*webqsp*train*.json"
-  copy_first_match "$DATA_DIR/webqsp/dev.json" "*/webqsp/dev.json" "*webqsp*dev*.json"
-  copy_first_match "$DATA_DIR/webqsp/entities.txt" "*/webqsp/entities.txt" "*webqsp*entities*.txt" "entity_ids.txt"
-  copy_first_match "$DATA_DIR/webqsp/relations.txt" "*/webqsp/relations.txt" "*webqsp*relations*.txt" "relation_ids.txt"
-fi
-
-if [ "$TARGET_DATASET" = "cwq" ] || [ "$TARGET_DATASET" = "all" ]; then
-  copy_first_match "$DATA_DIR/CWQ/train_split.jsonl" "*/CWQ/train_split.jsonl" "*/CWQ/train.jsonl" "*/CWQ/train.json" "*cwq*train*.jsonl" "*cwq*train*.json"
-  copy_first_match "$DATA_DIR/CWQ/dev_split.jsonl" "*/CWQ/dev_split.jsonl" "*/CWQ/dev.jsonl" "*/CWQ/dev.json" "*cwq*dev*.jsonl" "*cwq*dev*.json"
-  copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" "*/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" "*/CWQ/entity_ids.txt" "*/CWQ/entities.txt" "*cwq*entity*ids*.txt" "*cwq*entities*.txt"
-  copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" "*/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" "*/CWQ/relation_ids.txt" "*/CWQ/relations.txt" "*cwq*relation*ids*.txt" "*cwq*relations*.txt"
-fi
-
-# 5) Verification
 set +e
 status=0
 if [ "$TARGET_DATASET" = "webqsp" ] || [ "$TARGET_DATASET" = "all" ]; then
   require_path "$DATA_DIR/webqsp/train.json" || status=1
   require_path "$DATA_DIR/webqsp/dev.json" || status=1
+  require_path "$DATA_DIR/webqsp/test.json" || status=1
   require_path "$DATA_DIR/webqsp/entities.txt" || status=1
   require_path "$DATA_DIR/webqsp/relations.txt" || status=1
 fi
 if [ "$TARGET_DATASET" = "cwq" ] || [ "$TARGET_DATASET" = "all" ]; then
   require_path "$DATA_DIR/CWQ/train_split.jsonl" || status=1
   require_path "$DATA_DIR/CWQ/dev_split.jsonl" || status=1
+  require_path "$DATA_DIR/CWQ/test_split.jsonl" || status=1
   require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" || status=1
   require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" || status=1
+  require_path "$DATA_DIR/data/CWQ/test.json" || status=1
 fi
 set -e
 
 if [ "$status" -ne 0 ]; then
-  echo "[done] data setup incomplete. Check file names under data/.downloads and update env URLs if needed."
+  echo "[done] RoG HF data preparation incomplete."
   exit 2
 fi
 
-echo "[done] data is ready"
+echo "[done] RoG HF data is ready"

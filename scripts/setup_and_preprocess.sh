@@ -17,7 +17,7 @@ TRAIN_PATH_POLICY="${TRAIN_PATH_POLICY:-shortest_only}"
 TRAIN_SHORTEST_K="${TRAIN_SHORTEST_K:-1}"
 
 echo "[step] download + map data"
-DATASET="$DATASET" bash scripts/download_data.sh
+DATA_SOURCE="${DATA_SOURCE:-rog_hf}" DATASET="$DATASET" bash scripts/download_data.sh
 
 echo "[step] preprocess"
 if [ "$DATASET" = "all" ]; then
