@@ -24,27 +24,35 @@ EMBED_STYLE="${EMBED_STYLE:-gnn_rag_gnn_exact}"
 EMBED_BACKEND="${EMBED_BACKEND:-sentence_transformers}"
 ENTITY_NAMES_JSON="${ENTITY_NAMES_JSON:-data/data/entities_names.json}"
 
-DOWNLOAD_FIRST="${DOWNLOAD_FIRST:-1}"
 RUN_PREPROCESS="${RUN_PREPROCESS:-1}"
-DATA_SOURCE="${DATA_SOURCE:-rog_hf}"
-HF_CACHE_DIR="${HF_CACHE_DIR:-}"
-ROG_CWQ_DATASET="${ROG_CWQ_DATASET:-rmanluo/RoG-cwq}"
-ROG_WEBQSP_DATASET="${ROG_WEBQSP_DATASET:-rmanluo/RoG-webqsp}"
-
 MAX_STEPS="${MAX_STEPS:-4}"
 MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
 PREPROCESS_WORKERS="${PREPROCESS_WORKERS:-0}"
 
-if [ "$DOWNLOAD_FIRST" = "1" ]; then
-  echo "[step] download + map data"
-  DATASET="$DATASET" \
-  DATA_SOURCE="$DATA_SOURCE" \
-  HF_CACHE_DIR="$HF_CACHE_DIR" \
-  ROG_CWQ_DATASET="$ROG_CWQ_DATASET" \
-  ROG_WEBQSP_DATASET="$ROG_WEBQSP_DATASET" \
-  bash scripts/download_data.sh
+if [ "$DATASET" = "cwq" ]; then
+  REQUIRED_RAW=(
+    "data/CWQ/train_split.jsonl"
+    "data/CWQ/dev_split.jsonl"
+    "data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt"
+    "data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
+  )
+else
+  REQUIRED_RAW=(
+    "data/webqsp/train.json"
+    "data/webqsp/dev.json"
+    "data/webqsp/entities.txt"
+    "data/webqsp/relations.txt"
+  )
 fi
+
+for p in "${REQUIRED_RAW[@]}"; do
+  if [ ! -f "$p" ]; then
+    echo "[err] required data file not found: $p"
+    echo "      run: bash trm_rag_style/scripts/run_download.sh"
+    exit 2
+  fi
+done
 
 COMMON_OVR=(
   "emb_tag=$EMB_TAG"
@@ -73,6 +81,14 @@ if [ "$RUN_PREPROCESS" = "1" ]; then
       "${COMMON_OVR[@]}"
 fi
 
+if [ "$RUN_PREPROCESS" != "1" ]; then
+  if [ ! -f "trm_agent/processed/${DATASET}/train.jsonl" ] || [ ! -f "trm_agent/processed/${DATASET}/dev.jsonl" ]; then
+    echo "[err] processed files not found under trm_agent/processed/${DATASET}"
+    echo "      set RUN_PREPROCESS=1 or run preprocess stage first."
+    exit 2
+  fi
+fi
+
 echo "[step] embed"
 $PYTHON_BIN -m trm_agent.run \
   --dataset "$DATASET" \
@@ -80,5 +96,5 @@ $PYTHON_BIN -m trm_agent.run \
   --embedding_model "$EMB_MODEL" \
   --override "${COMMON_OVR[@]}"
 
-echo "[done] download + preprocess + embed complete"
+echo "[done] preprocess + embed complete"
 echo "       emb dir: trm_agent/emb/${DATASET}_${EMB_TAG}"

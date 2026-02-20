@@ -67,6 +67,12 @@ def _default_cuda_visible_devices(cuda_count: int) -> str:
     return ",".join(str(i) for i in range(use_n))
 
 
+def _default_emb_tag(model_name: str) -> str:
+    raw = (model_name or "").replace("/", "__").replace(":", "__")
+    cleaned = re.sub(r"[^0-9A-Za-z_.-]", "", raw)
+    return cleaned or "embed"
+
+
 def _print_cmd(cmd: List[str]) -> None:
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
 
@@ -112,6 +118,7 @@ class Cfg:
     dataset: str
     model_impl: str
     emb_model: str
+    emb_tag: str
     max_steps: int
     max_paths: int
     mine_max_neighbors: int
@@ -192,6 +199,13 @@ class Cfg:
     phase2_rl_no_cycle: bool
     phase2_rl_adv_clip: float
     train_acc_mode: str
+    train_sanity_eval_every_pct: int
+    train_sanity_eval_limit: int
+    train_sanity_eval_beam: int
+    train_sanity_eval_start_topk: int
+    train_sanity_eval_pred_topk: int
+    train_sanity_eval_no_cycle: bool
+    train_sanity_eval_use_halt: bool
     test_eval_limit: int
     test_debug_eval_n: int
     test_batch_size: int
@@ -211,6 +225,7 @@ class Cfg:
         dataset = _env("DATASET", "cwq")
         model_impl = _env("MODEL_IMPL", "trm_hier6")
         emb_model = _env("EMB_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        emb_tag = _env("EMB_TAG", _default_emb_tag(emb_model))
         epochs_phase1 = _env_int("EPOCHS_PHASE1", 5)
         epochs_phase2 = _env_int("EPOCHS_PHASE2", 20)
         ddp_timeout = _env_int("DDP_TIMEOUT_MINUTES", 180)
@@ -227,6 +242,7 @@ class Cfg:
             dataset=dataset,
             model_impl=model_impl,
             emb_model=emb_model,
+            emb_tag=emb_tag,
             max_steps=_env_int("MAX_STEPS", 4),
             max_paths=_env_int("MAX_PATHS", 4),
             mine_max_neighbors=_env_int("MINE_MAX_NEIGHBORS", 128),
@@ -307,6 +323,13 @@ class Cfg:
             phase2_rl_no_cycle=_env_bool("PHASE2_RL_NO_CYCLE", True),
             phase2_rl_adv_clip=_env_float("PHASE2_RL_ADV_CLIP", 1.0),
             train_acc_mode=_env("TRAIN_ACC_MODE", "auto"),
+            train_sanity_eval_every_pct=_env_int("TRAIN_SANITY_EVAL_EVERY_PCT", 10),
+            train_sanity_eval_limit=_env_int("TRAIN_SANITY_EVAL_LIMIT", 5),
+            train_sanity_eval_beam=_env_int("TRAIN_SANITY_EVAL_BEAM", 5),
+            train_sanity_eval_start_topk=_env_int("TRAIN_SANITY_EVAL_START_TOPK", 5),
+            train_sanity_eval_pred_topk=_env_int("TRAIN_SANITY_EVAL_PRED_TOPK", 1),
+            train_sanity_eval_no_cycle=_env_bool("TRAIN_SANITY_EVAL_NO_CYCLE", False),
+            train_sanity_eval_use_halt=_env_bool("TRAIN_SANITY_EVAL_USE_HALT", False),
             test_eval_limit=_env_int("TEST_EVAL_LIMIT", -1),
             test_debug_eval_n=_env_int("TEST_DEBUG_EVAL_N", 5),
             test_batch_size=_env_int("TEST_BATCH_SIZE", 6),
@@ -370,14 +393,19 @@ def _shared_env(cfg: Cfg) -> Dict[str, str]:
     return env
 
 
-def run_preprocess(cfg: Cfg, env: Dict[str, str]) -> None:
+def run_download(cfg: Cfg, env: Dict[str, str]) -> None:
     dl_script = cfg.repo_root / "scripts" / "download_data.sh"
-    if not cfg.skip_download and dl_script.exists():
+    if cfg.skip_download:
+        return
+    if dl_script.exists():
         if shutil.which("bash"):
             _run(["bash", str(dl_script)], cwd=cfg.repo_root, env=env)
         else:
             print("[warn] bash not found. Skipping scripts/download_data.sh.")
             print("[warn] Prepare dataset files manually or rerun with --skip-download.")
+
+
+def run_preprocess(cfg: Cfg, env: Dict[str, str]) -> None:
 
     cmd = _trm_agent_cmd(
         stage="preprocess",
@@ -395,6 +423,7 @@ def run_preprocess(cfg: Cfg, env: Dict[str, str]) -> None:
 
 def run_embed(cfg: Cfg, env: Dict[str, str]) -> None:
     overrides: Dict[str, object] = {
+        "emb_tag": cfg.emb_tag,
         "embed_device": cfg.embed_device,
         "embed_gpus": cfg.embed_gpus,
         "embed_style": cfg.embed_style,
@@ -410,6 +439,7 @@ def run_embed(cfg: Cfg, env: Dict[str, str]) -> None:
 def run_phase1(cfg: Cfg, env: Dict[str, str]) -> None:
     cfg.ckpt_dir_phase1.mkdir(parents=True, exist_ok=True)
     overrides = {
+        "emb_tag": cfg.emb_tag,
         "ckpt": "",
         "ckpt_dir": str(cfg.ckpt_dir_phase1),
         "epochs": cfg.epochs_phase1,
@@ -442,6 +472,13 @@ def run_phase1(cfg: Cfg, env: Dict[str, str]) -> None:
         "phase2_start_epoch": 0,
         "phase2_auto_enabled": False,
         "train_acc_mode": cfg.train_acc_mode,
+        "train_sanity_eval_every_pct": cfg.train_sanity_eval_every_pct,
+        "train_sanity_eval_limit": cfg.train_sanity_eval_limit,
+        "train_sanity_eval_beam": cfg.train_sanity_eval_beam,
+        "train_sanity_eval_start_topk": cfg.train_sanity_eval_start_topk,
+        "train_sanity_eval_pred_topk": cfg.train_sanity_eval_pred_topk,
+        "train_sanity_eval_no_cycle": cfg.train_sanity_eval_no_cycle,
+        "train_sanity_eval_use_halt": cfg.train_sanity_eval_use_halt,
         "ddp_find_unused": cfg.ddp_find_unused,
         "wandb_mode": cfg.wandb_mode,
         "wandb_project": cfg.wandb_project,
@@ -470,6 +507,7 @@ def run_phase2(cfg: Cfg, env: Dict[str, str]) -> None:
         )
 
     overrides = {
+        "emb_tag": cfg.emb_tag,
         "ckpt": str(ckpt_path),
         "ckpt_dir": str(cfg.ckpt_dir_phase2),
         "epochs": cfg.epochs_phase2,
@@ -504,6 +542,13 @@ def run_phase2(cfg: Cfg, env: Dict[str, str]) -> None:
         "phase2_rl_no_cycle": cfg.phase2_rl_no_cycle,
         "phase2_rl_adv_clip": cfg.phase2_rl_adv_clip,
         "train_acc_mode": cfg.train_acc_mode,
+        "train_sanity_eval_every_pct": cfg.train_sanity_eval_every_pct,
+        "train_sanity_eval_limit": cfg.train_sanity_eval_limit,
+        "train_sanity_eval_beam": cfg.train_sanity_eval_beam,
+        "train_sanity_eval_start_topk": cfg.train_sanity_eval_start_topk,
+        "train_sanity_eval_pred_topk": cfg.train_sanity_eval_pred_topk,
+        "train_sanity_eval_no_cycle": cfg.train_sanity_eval_no_cycle,
+        "train_sanity_eval_use_halt": cfg.train_sanity_eval_use_halt,
         "ddp_find_unused": cfg.ddp_find_unused,
         "wandb_mode": cfg.wandb_mode,
         "wandb_project": cfg.wandb_project,
@@ -532,6 +577,7 @@ def run_test(cfg: Cfg, env: Dict[str, str]) -> None:
             "Run phase2 first or set PHASE2_CKPT=/path/to/model_epX.pt"
         )
     overrides = {
+        "emb_tag": cfg.emb_tag,
         "eval_limit": cfg.test_eval_limit,
         "debug_eval_n": cfg.test_debug_eval_n,
         "batch_size": cfg.test_batch_size,
@@ -558,7 +604,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Cross-platform paperstyle pipeline runner")
     parser.add_argument(
         "--stage",
-        choices=["preprocess", "embed", "phase1", "phase2", "test", "all"],
+        choices=["download", "preprocess", "embed", "phase1", "phase2", "test", "all"],
         default="all",
     )
     parser.add_argument("--skip-download", action="store_true", help="skip optional download_data.sh call")
@@ -570,10 +616,12 @@ def main() -> int:
         cfg.skip_download = True
     env = _shared_env(cfg)
 
-    stages = [args.stage] if args.stage != "all" else ["preprocess", "embed", "phase1", "phase2", "test"]
+    stages = [args.stage] if args.stage != "all" else ["download", "preprocess", "embed", "phase1", "phase2", "test"]
     for st in stages:
         print(f"\n[stage] {st}")
-        if st == "preprocess":
+        if st == "download":
+            run_download(cfg, env)
+        elif st == "preprocess":
             run_preprocess(cfg, env)
         elif st == "embed":
             run_embed(cfg, env)

@@ -8,6 +8,8 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-0,1,2}
 DATASET=${DATASET:-webqsp}
 MODEL_IMPL=${MODEL_IMPL:-trm_hier6}
 EMB_MODEL=${EMB_MODEL:-intfloat/multilingual-e5-large}
+EMB_TAG=${EMB_TAG:-$(echo "$EMB_MODEL" | tr '/:' '__' | tr -cd '[:alnum:]_.-')}
+EMB_DIR=${EMB_DIR:-trm_agent/emb/${DATASET}_${EMB_TAG}}
 CKPT=${CKPT:-}
 CKPT_DIR=${CKPT_DIR:-trm_rag_style/ckpt/${DATASET}_${MODEL_IMPL}}
 EPOCHS=${EPOCHS:-5}
@@ -80,6 +82,15 @@ PHASE2_RL_USE_GREEDY_BASELINE=${PHASE2_RL_USE_GREEDY_BASELINE:-true}
 PHASE2_RL_NO_CYCLE=${PHASE2_RL_NO_CYCLE:-true}
 PHASE2_RL_ADV_CLIP=${PHASE2_RL_ADV_CLIP:-}
 TRAIN_ACC_MODE=${TRAIN_ACC_MODE:-endpoint_proxy}
+TRAIN_SANITY_EVAL_EVERY_PCT=${TRAIN_SANITY_EVAL_EVERY_PCT:-0}
+TRAIN_SANITY_EVAL_LIMIT=${TRAIN_SANITY_EVAL_LIMIT:-5}
+TRAIN_SANITY_EVAL_BEAM=${TRAIN_SANITY_EVAL_BEAM:-5}
+TRAIN_SANITY_EVAL_START_TOPK=${TRAIN_SANITY_EVAL_START_TOPK:-5}
+TRAIN_SANITY_EVAL_PRED_TOPK=${TRAIN_SANITY_EVAL_PRED_TOPK:-1}
+TRAIN_SANITY_EVAL_NO_CYCLE=${TRAIN_SANITY_EVAL_NO_CYCLE:-$EVAL_NO_CYCLE}
+TRAIN_SANITY_EVAL_USE_HALT=${TRAIN_SANITY_EVAL_USE_HALT:-false}
+TRAIN_SANITY_EVAL_MAX_NEIGHBORS=${TRAIN_SANITY_EVAL_MAX_NEIGHBORS:-$EVAL_MAX_NEIGHBORS}
+TRAIN_SANITY_EVAL_PRUNE_KEEP=${TRAIN_SANITY_EVAL_PRUNE_KEEP:-$EVAL_PRUNE_KEEP}
 ORACLE_DIAG_ENABLED=${ORACLE_DIAG_ENABLED:-true}
 ORACLE_DIAG_LIMIT=${ORACLE_DIAG_LIMIT:-500}
 ORACLE_DIAG_FAIL_THRESHOLD=${ORACLE_DIAG_FAIL_THRESHOLD:--1}
@@ -93,6 +104,13 @@ FREEZE_LM_HEAD=${FREEZE_LM_HEAD:-true}
 DDP_TIMEOUT_MINUTES=${DDP_TIMEOUT_MINUTES:-180}
 export DDP_TIMEOUT_MINUTES
 
+if [ ! -f "$EMB_DIR/entity_embeddings.npy" ] || [ ! -f "$EMB_DIR/relation_embeddings.npy" ] || [ ! -f "$EMB_DIR/query_train.npy" ]; then
+  echo "[err] required embedding files are missing in $EMB_DIR"
+  echo "      expected: entity_embeddings.npy, relation_embeddings.npy, query_train.npy"
+  echo "      run: DATASET=$DATASET EMB_MODEL=$EMB_MODEL bash trm_rag_style/scripts/run_embed.sh"
+  exit 2
+fi
+
 TORCHRUN=${TORCHRUN:-torchrun}
 MASTER_PORT=${MASTER_PORT:-29500}
 NPROC_PER_NODE=${NPROC_PER_NODE:-3}
@@ -102,6 +120,8 @@ $TORCHRUN --nproc_per_node="$NPROC_PER_NODE" --master_port="$MASTER_PORT" -m trm
   --embedding_model "$EMB_MODEL" \
   --stage train \
   --override \
+    emb_tag="$EMB_TAG" \
+    emb_dir="$EMB_DIR" \
     ckpt="$CKPT" \
     ckpt_dir="$CKPT_DIR" \
     epochs="$EPOCHS" \
@@ -150,6 +170,15 @@ $TORCHRUN --nproc_per_node="$NPROC_PER_NODE" --master_port="$MASTER_PORT" -m trm
     phase2_rl_no_cycle="$PHASE2_RL_NO_CYCLE" \
     phase2_rl_adv_clip="$PHASE2_RL_ADV_CLIP" \
     train_acc_mode="$TRAIN_ACC_MODE" \
+    train_sanity_eval_every_pct="$TRAIN_SANITY_EVAL_EVERY_PCT" \
+    train_sanity_eval_limit="$TRAIN_SANITY_EVAL_LIMIT" \
+    train_sanity_eval_beam="$TRAIN_SANITY_EVAL_BEAM" \
+    train_sanity_eval_start_topk="$TRAIN_SANITY_EVAL_START_TOPK" \
+    train_sanity_eval_pred_topk="$TRAIN_SANITY_EVAL_PRED_TOPK" \
+    train_sanity_eval_no_cycle="$TRAIN_SANITY_EVAL_NO_CYCLE" \
+    train_sanity_eval_use_halt="$TRAIN_SANITY_EVAL_USE_HALT" \
+    train_sanity_eval_max_neighbors="$TRAIN_SANITY_EVAL_MAX_NEIGHBORS" \
+    train_sanity_eval_prune_keep="$TRAIN_SANITY_EVAL_PRUNE_KEEP" \
     oracle_diag_enabled="$ORACLE_DIAG_ENABLED" \
     oracle_diag_limit="$ORACLE_DIAG_LIMIT" \
     oracle_diag_fail_threshold="$ORACLE_DIAG_FAIL_THRESHOLD" \

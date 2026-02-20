@@ -9,6 +9,9 @@ cd "$REPO_ROOT"
 
 DATASET=${DATASET:-webqsp}
 MODEL_IMPL=${MODEL_IMPL:-trm_hier6}
+EMB_MODEL=${EMB_MODEL:-intfloat/multilingual-e5-large}
+EMB_TAG=${EMB_TAG:-$(echo "$EMB_MODEL" | tr '/:' '__' | tr -cd '[:alnum:]_.-')}
+EMB_DIR=${EMB_DIR:-trm_agent/emb/${DATASET}_${EMB_TAG}}
 CKPT=${CKPT:-}
 EVAL_LIMIT=${EVAL_LIMIT:--1}
 DEBUG_EVAL_N=${DEBUG_EVAL_N:-5}
@@ -28,12 +31,21 @@ if [ -z "$CKPT" ]; then
   exit 1
 fi
 
+if [ ! -f "$EMB_DIR/entity_embeddings.npy" ] || [ ! -f "$EMB_DIR/relation_embeddings.npy" ] || [ ! -f "$EMB_DIR/query_test.npy" ]; then
+  echo "[err] required embedding files are missing in $EMB_DIR"
+  echo "      expected: entity_embeddings.npy, relation_embeddings.npy, query_test.npy"
+  echo "      run embed first with same EMB_MODEL/EMB_TAG."
+  exit 2
+fi
+
 $PYTHON_BIN -m trm_agent.run \
   --dataset "$DATASET" \
   --model_impl "$MODEL_IMPL" \
   --stage test \
   --ckpt "$CKPT" \
   --override \
+    emb_tag="$EMB_TAG" \
+    emb_dir="$EMB_DIR" \
     eval_limit="$EVAL_LIMIT" \
     debug_eval_n="$DEBUG_EVAL_N" \
     batch_size="$BATCH_SIZE" \

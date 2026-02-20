@@ -1126,6 +1126,18 @@ def train(args):
             return None
         return int(v)
 
+    def _as_bool(v, default=False):
+        if v is None:
+            return bool(default)
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+
     endpoint_aux_weight = float(getattr(args, 'endpoint_aux_weight', 0.0))
     metric_align_aux_weight = float(getattr(args, 'metric_align_aux_weight', getattr(args, 'policy_aux_weight', 0.0)))
     endpoint_loss_mode = str(getattr(args, 'endpoint_loss_mode', 'aux')).strip().lower()
@@ -1162,6 +1174,20 @@ def train(args):
     phase2_auto_active = False
     phase2_auto_bad_count = 0
     phase2_auto_best = None
+
+    train_sanity_eval_every_pct = int(getattr(args, 'train_sanity_eval_every_pct', 0))
+    train_sanity_eval_limit = int(getattr(args, 'train_sanity_eval_limit', 5))
+    train_sanity_eval_beam = int(getattr(args, 'train_sanity_eval_beam', 5))
+    train_sanity_eval_start_topk = int(getattr(args, 'train_sanity_eval_start_topk', getattr(args, 'start_topk', 5)))
+    train_sanity_eval_pred_topk = int(getattr(args, 'train_sanity_eval_pred_topk', 1))
+    train_sanity_eval_no_cycle = _as_bool(getattr(args, 'train_sanity_eval_no_cycle', getattr(args, 'eval_no_cycle', False)))
+    train_sanity_eval_use_halt = _as_bool(getattr(args, 'train_sanity_eval_use_halt', False))
+    train_sanity_eval_max_neighbors = int(getattr(args, 'train_sanity_eval_max_neighbors', getattr(args, 'eval_max_neighbors', args.max_neighbors)))
+    train_sanity_eval_prune_keep = int(getattr(args, 'train_sanity_eval_prune_keep', getattr(args, 'eval_prune_keep', args.prune_keep)))
+    if train_sanity_eval_every_pct < 0:
+        train_sanity_eval_every_pct = 0
+    if train_sanity_eval_limit < 0:
+        train_sanity_eval_limit = 0
 
     endpoint_main_modes = {'main', 'endpoint_main', 'endpoint-first', 'endpoint_first'}
     rl_scst_modes = {'rl_scst', 'scst', 'reinforce', 'policy_gradient'}
@@ -1457,6 +1483,9 @@ def train(args):
             )
         last_phase2_state = bool(use_phase2)
         pbar = tqdm(loader, disable=not is_main, desc=f'Ep {ep}')
+        sanity_interval_steps = 0
+        if train_sanity_eval_every_pct > 0:
+            sanity_interval_steps = max(1, int(math.ceil((float(len(loader)) * float(train_sanity_eval_every_pct)) / 100.0)))
         tot_loss = 0.0
         tot_metric_sum = 0.0
         tot_metric_count = 0
@@ -1704,6 +1733,62 @@ def train(args):
                         wb_payload,
                         step=(ep - 1) * max(1, len(loader)) + steps,
                     )
+            should_sanity_eval = (
+                train_sanity_eval_every_pct > 0
+                and train_sanity_eval_limit > 0
+                and sanity_interval_steps > 0
+                and (steps % sanity_interval_steps == 0)
+            )
+            if should_sanity_eval:
+                if is_ddp:
+                    dist.barrier()
+                if is_main:
+                    eval_model = model.module if hasattr(model, 'module') else model
+                    sh, sf, ss = evaluate_relation_beam(
+                        model=eval_model,
+                        carry_init_fn=carry_init_fn,
+                        eval_json=args.train_json,
+                        kb2idx=kb2idx,
+                        rel2idx=rel2idx,
+                        device=device,
+                        tokenizer_name=args.trm_tokenizer,
+                        q_npy=getattr(args, 'query_emb_train_npy', ''),
+                        rel_npy=args.relation_emb_npy,
+                        max_steps=int(getattr(args, 'eval_max_steps', args.max_steps)),
+                        max_neighbors=int(train_sanity_eval_max_neighbors),
+                        prune_keep=int(train_sanity_eval_prune_keep),
+                        start_topk=int(max(1, train_sanity_eval_start_topk)),
+                        beam=int(max(1, train_sanity_eval_beam)),
+                        max_q_len=args.max_q_len,
+                        eval_limit=int(train_sanity_eval_limit),
+                        debug_n=0,
+                        no_cycle=bool(train_sanity_eval_no_cycle),
+                        eval_pred_topk=int(max(1, train_sanity_eval_pred_topk)),
+                        eval_use_halt=bool(train_sanity_eval_use_halt),
+                        eval_min_hops_before_stop=int(getattr(args, 'eval_min_hops_before_stop', 1)),
+                        entity_labels=None,
+                        relation_labels=None,
+                    )
+                    print(
+                        f"[TrainSanity] ep={ep} step={steps}/{len(loader)} "
+                        f"(~{int((100.0*steps)/max(1,len(loader)))}%) "
+                        f"Hit@1={sh:.4f} F1={sf:.4f} Skip={ss} "
+                        f"beam={int(max(1, train_sanity_eval_beam))} n={int(train_sanity_eval_limit)}"
+                    )
+                    if wb is not None:
+                        wb.log(
+                            {
+                                "train_sanity/hit1": float(sh),
+                                "train_sanity/f1": float(sf),
+                                "train_sanity/skip": int(ss),
+                                "train_sanity/epoch": int(ep),
+                                "train_sanity/step": int(steps),
+                            },
+                            step=(ep - 1) * max(1, len(loader)) + steps,
+                        )
+                if is_ddp:
+                    dist.barrier()
+                model.train()
 
         epoch_tot_loss = float(tot_loss)
         epoch_steps = int(steps)
@@ -1872,6 +1957,8 @@ def train(args):
             )
             dist.broadcast(phase2_tensor, src=0)
             phase2_auto_active = bool(int(phase2_tensor.item()))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # Keep all ranks in sync while rank0 runs (potentially long) dev eval.
         if is_ddp:
             dist.barrier()

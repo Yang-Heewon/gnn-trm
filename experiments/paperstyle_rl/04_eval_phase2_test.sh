@@ -26,6 +26,8 @@ echo "Using phase2 checkpoint: $CKPT"
 set -o pipefail
 DATASET="$DATASET" \
 MODEL_IMPL="$MODEL_IMPL" \
+EMB_MODEL="$EMB_MODEL" \
+EMB_TAG="$EMB_TAG" \
 CKPT="$CKPT" \
 EVAL_LIMIT="$TEST_EVAL_LIMIT" \
 DEBUG_EVAL_N="$TEST_DEBUG_EVAL_N" \

@@ -7,6 +7,8 @@ cd "$REPO_ROOT"
 
 export DATASET="${DATASET:-cwq}"
 export MODEL_IMPL="${MODEL_IMPL:-trm_hier6}"
+export EMB_MODEL="${EMB_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+export EMB_TAG="${EMB_TAG:-$(echo "$EMB_MODEL" | tr '/:' '__' | tr -cd '[:alnum:]_.-')}"
 export TORCHRUN="${TORCHRUN:-/data2/workspace/heewon/anaconda3/envs/taiLab/bin/torchrun}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 export MASTER_PORT="${MASTER_PORT:-29631}"

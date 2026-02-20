@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("preprocess", "embed", "phase1", "phase2", "test", "all")]
+    [ValidateSet("download", "preprocess", "embed", "phase1", "phase2", "test", "all")]
     [string]$Stage = "all",
     [switch]$SkipDownload
 )
