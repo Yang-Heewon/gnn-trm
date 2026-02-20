@@ -73,6 +73,9 @@
   "phase2_rl_no_cycle": true,
   "phase2_rl_adv_clip": "",
   "train_acc_mode": "endpoint_proxy",
+  "query_residual_enabled": false,
+  "query_residual_alpha": 0.0,
+  "query_residual_mode": "sub_rel",
 
   "seq_len": 1024,
   "hidden_size": 512,

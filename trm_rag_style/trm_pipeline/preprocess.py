@@ -124,11 +124,16 @@ def run(cfg):
     )
 
     out.update({'train': tr, 'dev': dv})
-    if cfg.get('test_in'):
+    test_in = str(cfg.get('test_in') or '').strip()
+    if test_in:
+        if not os.path.exists(test_in):
+            print(f"[warn] test_in not found: {test_in} (skip test preprocess)")
+            print('✅ preprocess done:', out)
+            return out
         test_out = os.path.join(cfg['processed_dir'], 'test.jsonl')
         te = preprocess_split(
             dataset=cfg['dataset'],
-            input_path=cfg['test_in'],
+            input_path=test_in,
             output_path=test_out,
             entities_txt=cfg['entities_txt'],
             max_steps=int(cfg['max_steps']),

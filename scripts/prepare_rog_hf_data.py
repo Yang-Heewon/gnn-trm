@@ -190,7 +190,13 @@ def _write_list(path: str, values: List[str]):
             w.write(f"{v}\n")
 
 
-def _convert_dataset(ds_name: str, hf_name: str, out_root: str, cache_dir: str = ""):
+def _convert_dataset(
+    ds_name: str,
+    hf_name: str,
+    out_root: str,
+    cache_dir: str = "",
+    cwq_vocab_only: bool = False,
+):
     try:
         from datasets import load_dataset
     except Exception as e:
@@ -220,45 +226,55 @@ def _convert_dataset(ds_name: str, hf_name: str, out_root: str, cache_dir: str =
     }
 
     counts = {}
-    for hf_split, out_split in split_map.items():
-        if hf_split not in ds_dict:
-            continue
-        rows = (
-            _convert_example(ex, ent_vocab, rel_vocab)
-            for ex in tqdm(ds_dict[hf_split], desc=f"convert:{ds_name}:{out_split}", unit="ex")
-        )
+    skip_split_conversion = ds_name == "cwq" and cwq_vocab_only
+    if not skip_split_conversion:
+        for hf_split, out_split in split_map.items():
+            if hf_split not in ds_dict:
+                continue
+            rows = (
+                _convert_example(ex, ent_vocab, rel_vocab)
+                for ex in tqdm(ds_dict[hf_split], desc=f"convert:{ds_name}:{out_split}", unit="ex")
+            )
 
-        if ds_name == "cwq":
-            if out_split == "train":
-                out_path = os.path.join(out_root, "data", "CWQ", "train_split.jsonl")
-            elif out_split == "dev":
-                out_path = os.path.join(out_root, "data", "CWQ", "dev_split.jsonl")
+            if ds_name == "cwq":
+                if out_split == "train":
+                    out_path = os.path.join(out_root, "data", "CWQ", "train_split.jsonl")
+                elif out_split == "dev":
+                    out_path = os.path.join(out_root, "data", "CWQ", "dev_split.jsonl")
+                else:
+                    out_path = os.path.join(out_root, "data", "CWQ", "test_split.jsonl")
             else:
-                out_path = os.path.join(out_root, "data", "CWQ", "test_split.jsonl")
-        else:
-            # Keep legacy file names expected by current config.
-            if out_split == "train":
-                out_path = os.path.join(out_root, "data", "webqsp", "train.json")
-            elif out_split == "dev":
-                out_path = os.path.join(out_root, "data", "webqsp", "dev.json")
-            else:
-                out_path = os.path.join(out_root, "data", "webqsp", "test.json")
+                # Keep legacy file names expected by current config.
+                if out_split == "train":
+                    out_path = os.path.join(out_root, "data", "webqsp", "train.json")
+                elif out_split == "dev":
+                    out_path = os.path.join(out_root, "data", "webqsp", "dev.json")
+                else:
+                    out_path = os.path.join(out_root, "data", "webqsp", "test.json")
 
-        counts[out_split] = _write_jsonl(out_path, rows)
-        print(f"[write] {out_path} rows={counts[out_split]}")
+            counts[out_split] = _write_jsonl(out_path, rows)
+            print(f"[write] {out_path} rows={counts[out_split]}")
+    else:
+        counts["mode"] = "cwq_vocab_only"
+        print("[mode] cwq vocab-only: split conversion skipped")
 
     if ds_name == "cwq":
-        emb_root = os.path.join(out_root, "data", "CWQ", "embeddings_output", "CWQ", "e5")
-        os.makedirs(emb_root, exist_ok=True)
-        _write_list(os.path.join(emb_root, "entity_ids.txt"), ent_vocab.items_in_order())
-        _write_list(os.path.join(emb_root, "relation_ids.txt"), rel_vocab.items_in_order())
+        cwq_root = os.path.join(out_root, "data", "CWQ")
+        _write_list(os.path.join(cwq_root, "entities.txt"), ent_vocab.items_in_order())
+        _write_list(os.path.join(cwq_root, "relations.txt"), rel_vocab.items_in_order())
 
-        # Compatibility path used by existing cwq config.
-        test_src = os.path.join(out_root, "data", "CWQ", "test_split.jsonl")
-        test_dst = os.path.join(out_root, "data", "data", "CWQ", "test.json")
-        os.makedirs(os.path.dirname(test_dst), exist_ok=True)
-        shutil.copy2(test_src, test_dst)
-        counts["test_compat_path"] = test_dst
+        if not cwq_vocab_only:
+            emb_root = os.path.join(out_root, "data", "CWQ", "embeddings_output", "CWQ", "e5")
+            os.makedirs(emb_root, exist_ok=True)
+            _write_list(os.path.join(emb_root, "entity_ids.txt"), ent_vocab.items_in_order())
+            _write_list(os.path.join(emb_root, "relation_ids.txt"), rel_vocab.items_in_order())
+
+            # Compatibility path used by existing cwq config.
+            test_src = os.path.join(out_root, "data", "CWQ", "test_split.jsonl")
+            test_dst = os.path.join(out_root, "data", "data", "CWQ", "test.json")
+            os.makedirs(os.path.dirname(test_dst), exist_ok=True)
+            shutil.copy2(test_src, test_dst)
+            counts["test_compat_path"] = test_dst
     else:
         web_root = os.path.join(out_root, "data", "webqsp")
         _write_list(os.path.join(web_root, "entities.txt"), ent_vocab.items_in_order())
@@ -278,6 +294,11 @@ def _convert_dataset(ds_name: str, hf_name: str, out_root: str, cache_dir: str =
 def main():
     ap = argparse.ArgumentParser(description="Prepare RoG HF datasets for GRAPH-TRAVERSE pipeline")
     ap.add_argument("--dataset", choices=["cwq", "webqsp", "all"], default="all")
+    ap.add_argument(
+        "--cwq_vocab_only",
+        action="store_true",
+        help="For CWQ only: write entities.txt and relations.txt, and skip split JSONL conversion.",
+    )
     ap.add_argument("--cwq_name", default="rmanluo/RoG-cwq")
     ap.add_argument("--webqsp_name", default="rmanluo/RoG-webqsp")
     ap.add_argument("--out_root", default=".")
@@ -285,9 +306,20 @@ def main():
     args = ap.parse_args()
 
     out_root = os.path.abspath(args.out_root)
+    if args.cwq_vocab_only and args.dataset != "cwq":
+        raise SystemExit("--cwq_vocab_only can be used only with --dataset cwq")
+
     metas = []
     if args.dataset in {"cwq", "all"}:
-        metas.append(_convert_dataset("cwq", args.cwq_name, out_root, cache_dir=args.cache_dir))
+        metas.append(
+            _convert_dataset(
+                "cwq",
+                args.cwq_name,
+                out_root,
+                cache_dir=args.cache_dir,
+                cwq_vocab_only=args.cwq_vocab_only,
+            )
+        )
     if args.dataset in {"webqsp", "all"}:
         metas.append(_convert_dataset("webqsp", args.webqsp_name, out_root, cache_dir=args.cache_dir))
 

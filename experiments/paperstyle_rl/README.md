@@ -8,36 +8,19 @@ This folder contains the active preset:
 4. `phase2` RL fine-tune
 5. `test` evaluation
 
-## Cross-Platform Entrypoint
+## Entrypoint
 
-Use `run_pipeline.py` on Linux/macOS/Windows.
-
-Linux/macOS:
+Use `run_pipeline.py`:
 
 ```bash
 cd /data2/workspace/heewon/GRAPH-TRAVERSE
 python experiments/paperstyle_rl/run_pipeline.py --stage all
 ```
 
-Windows PowerShell:
-
-```powershell
-cd C:\path\to\GRAPH-TRAVERSE
-.\experiments\paperstyle_rl\run_pipeline.ps1 -Stage all
-```
-
-Windows CMD:
-
-```bat
-cd C:\path\to\GRAPH-TRAVERSE
-experiments\paperstyle_rl\run_pipeline.cmd --stage all
-```
-
 Run one stage only:
 
 ```bash
 python experiments/paperstyle_rl/run_pipeline.py --stage download
-python experiments/paperstyle_rl/run_pipeline.py --stage preprocess
 python experiments/paperstyle_rl/run_pipeline.py --stage embed
 python experiments/paperstyle_rl/run_pipeline.py --stage phase1
 python experiments/paperstyle_rl/run_pipeline.py --stage phase2
@@ -83,6 +66,7 @@ Main variables:
 - `NPROC_PER_NODE_PHASE2` (default: `1`)
 - `WANDB_MODE`, `WANDB_PROJECT`, `WANDB_ENTITY`
 - `CKPT_DIR_PHASE1`, `CKPT_DIR_PHASE2`, `RESULTS_DIR`
+- `QUERY_RESIDUAL_ENABLED`, `QUERY_RESIDUAL_ALPHA`, `QUERY_RESIDUAL_MODE`
 
 Test-stage variables:
 
@@ -95,6 +79,7 @@ Test-stage variables:
 
 - In `gnn_rag_gnn_exact` mode, query/passage prefixes are empty.
 - Use the same `EMB_MODEL`/`EMB_TAG` for embed/train/test stages.
+- `run_embed.sh` supports `DATASET=cwq|webqsp|all`.
 - Phase2 automatically uses the latest phase1 checkpoint unless `PHASE1_CKPT` is set.
 - Test stage uses the latest phase2 checkpoint unless `PHASE2_CKPT` is set.
 - Test summaries/logs are under `experiments/paperstyle_rl/results/`.

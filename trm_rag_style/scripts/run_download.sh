@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 
 DATASET="${DATASET:-webqsp}" # cwq | webqsp | all
 DATA_SOURCE="${DATA_SOURCE:-rog_hf}"
+CWQ_VOCAB_ONLY="${CWQ_VOCAB_ONLY:-0}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-}"
 ROG_CWQ_DATASET="${ROG_CWQ_DATASET:-rmanluo/RoG-cwq}"
 ROG_WEBQSP_DATASET="${ROG_WEBQSP_DATASET:-rmanluo/RoG-webqsp}"
@@ -16,9 +17,10 @@ if [ "$DATASET" != "cwq" ] && [ "$DATASET" != "webqsp" ] && [ "$DATASET" != "all
   exit 2
 fi
 
-echo "[step] download + map data (DATASET=$DATASET, DATA_SOURCE=$DATA_SOURCE)"
+echo "[step] download + map data (DATASET=$DATASET, DATA_SOURCE=$DATA_SOURCE, CWQ_VOCAB_ONLY=$CWQ_VOCAB_ONLY)"
 DATASET="$DATASET" \
 DATA_SOURCE="$DATA_SOURCE" \
+CWQ_VOCAB_ONLY="$CWQ_VOCAB_ONLY" \
 HF_CACHE_DIR="$HF_CACHE_DIR" \
 ROG_CWQ_DATASET="$ROG_CWQ_DATASET" \
 ROG_WEBQSP_DATASET="$ROG_WEBQSP_DATASET" \

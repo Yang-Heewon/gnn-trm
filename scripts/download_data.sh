@@ -12,6 +12,7 @@ mkdir -p "$DATA_DIR" "$DATA_DIR/.downloads"
 
 TARGET_DATASET="$(echo "${DATASET:-all}" | tr '[:upper:]' '[:lower:]')"
 DATA_SOURCE="$(echo "${DATA_SOURCE:-rog_hf}" | tr '[:upper:]' '[:lower:]')"
+CWQ_VOCAB_ONLY="${CWQ_VOCAB_ONLY:-0}"
 ROG_CWQ_DATASET="${ROG_CWQ_DATASET:-rmanluo/RoG-cwq}"
 ROG_WEBQSP_DATASET="${ROG_WEBQSP_DATASET:-rmanluo/RoG-webqsp}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-}"
@@ -31,6 +32,14 @@ if [ "$DATA_SOURCE" != "rog_hf" ] && [ "$DATA_SOURCE" != "hf_rog" ] && [ "$DATA_
   echo "      set DATA_SOURCE=rog_hf"
   exit 2
 fi
+if [ "$CWQ_VOCAB_ONLY" != "0" ] && [ "$CWQ_VOCAB_ONLY" != "1" ]; then
+  echo "[err] CWQ_VOCAB_ONLY must be 0 or 1 (got: $CWQ_VOCAB_ONLY)"
+  exit 2
+fi
+if [ "$CWQ_VOCAB_ONLY" = "1" ] && [ "$TARGET_DATASET" != "cwq" ]; then
+  echo "[err] CWQ_VOCAB_ONLY=1 requires DATASET=cwq"
+  exit 2
+fi
 
 echo "[step] preparing RoG datasets from Hugging Face"
 PREP_ARGS=(
@@ -39,6 +48,9 @@ PREP_ARGS=(
   --webqsp_name "$ROG_WEBQSP_DATASET"
   --out_root "$REPO_ROOT"
 )
+if [ "$CWQ_VOCAB_ONLY" = "1" ]; then
+  PREP_ARGS+=(--cwq_vocab_only)
+fi
 if [ -n "$HF_CACHE_DIR" ]; then
   PREP_ARGS+=(--cache_dir "$HF_CACHE_DIR")
 fi
@@ -54,12 +66,16 @@ if [ "$TARGET_DATASET" = "webqsp" ] || [ "$TARGET_DATASET" = "all" ]; then
   require_path "$DATA_DIR/webqsp/relations.txt" || status=1
 fi
 if [ "$TARGET_DATASET" = "cwq" ] || [ "$TARGET_DATASET" = "all" ]; then
-  require_path "$DATA_DIR/CWQ/train_split.jsonl" || status=1
-  require_path "$DATA_DIR/CWQ/dev_split.jsonl" || status=1
-  require_path "$DATA_DIR/CWQ/test_split.jsonl" || status=1
-  require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" || status=1
-  require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" || status=1
-  require_path "$DATA_DIR/data/CWQ/test.json" || status=1
+  require_path "$DATA_DIR/CWQ/entities.txt" || status=1
+  require_path "$DATA_DIR/CWQ/relations.txt" || status=1
+  if [ "$CWQ_VOCAB_ONLY" != "1" ]; then
+    require_path "$DATA_DIR/CWQ/train_split.jsonl" || status=1
+    require_path "$DATA_DIR/CWQ/dev_split.jsonl" || status=1
+    require_path "$DATA_DIR/CWQ/test_split.jsonl" || status=1
+    require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" || status=1
+    require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" || status=1
+    require_path "$DATA_DIR/data/CWQ/test.json" || status=1
+  fi
 fi
 set -e
 

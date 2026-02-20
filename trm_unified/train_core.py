@@ -125,6 +125,41 @@ def _select_rel_candidates(
     return rel_cands
 
 
+def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = float(np.linalg.norm(x))
+    if n <= eps:
+        return x
+    return (x / (n + eps)).astype(np.float32, copy=False)
+
+
+def _apply_query_residual_np(
+    q_emb: np.ndarray,
+    rel_id: int,
+    rel_mem,
+    enabled: bool = False,
+    alpha: float = 0.0,
+    mode: str = "sub_rel",
+) -> np.ndarray:
+    if (not enabled) or alpha == 0.0:
+        return q_emb
+    m = str(mode or "sub_rel").strip().lower()
+    if m in {"none", "off", "disabled"}:
+        return q_emb
+
+    rid = int(rel_id)
+    if rid < 0 or rid >= int(rel_mem.shape[0]):
+        return q_emb
+
+    rel_vec = np.asarray(rel_mem[rid], dtype=np.float32)
+    q = np.asarray(q_emb, dtype=np.float32)
+    if m in {"add", "plus", "add_rel"}:
+        out = q + float(alpha) * rel_vec
+    else:
+        # Default: remove used-relation direction from query state.
+        out = q - float(alpha) * rel_vec
+    return _l2_normalize_np(out)
+
+
 class PathDataset(Dataset):
     def __init__(self, jsonl_path: str, max_steps: int):
         self.jsonl_path = jsonl_path
@@ -177,6 +212,9 @@ def make_collate(
     max_steps,
     endpoint_aux=False,
     entity_vocab_size: Optional[int] = None,
+    query_residual_enabled: bool = False,
+    query_residual_alpha: float = 0.0,
+    query_residual_mode: str = "sub_rel",
 ):
     tok = load_tokenizer(tokenizer_name)
     rel_mem = np.load(rel_npy, mmap_mode='r')
@@ -253,7 +291,15 @@ def make_collate(
             q_emb = np.asarray(q_mem[qi], dtype=np.float32)
             gold_set = set(int(x) for x in b.get('answers_cid', []))
             dist_to_goal = _shortest_dist_to_goals(adj, gold_set, max_steps) if gold_set else {}
-            sample_ctx.append((adj, q_emb, gold_set, {}, dist_to_goal))
+            sample_ctx.append(
+                {
+                    'adj': adj,
+                    'q_emb': q_emb,
+                    'gold_set': gold_set,
+                    'reach_memo': {},
+                    'dist_to_goal': dist_to_goal,
+                }
+            )
 
         seq_batches = []
         for t in range(max_steps):
@@ -266,7 +312,12 @@ def make_collate(
                     continue
                 cur = int(segs[idx])
                 gold_r = int(segs[idx + 1])
-                adj, q_emb, gold_set, reach_memo, dist_to_goal = sample_ctx[i]
+                ctx_i = sample_ctx[i]
+                adj = ctx_i['adj']
+                q_emb = ctx_i['q_emb']
+                gold_set = ctx_i['gold_set']
+                reach_memo = ctx_i['reach_memo']
+                dist_to_goal = ctx_i['dist_to_goal']
                 edges = adj.get(cur, [])
                 rel_to_nodes = _build_rel_to_nodes(edges)
                 rel_cands = _select_rel_candidates(
@@ -311,6 +362,14 @@ def make_collate(
                     endpoint_targets.append([1.0 if rr in pos_rels else 0.0 for rr in rel_cands])
                 else:
                     endpoint_targets.append([0.0] * len(rel_cands))
+                ctx_i['q_emb'] = _apply_query_residual_np(
+                    q_emb=q_emb,
+                    rel_id=gold_r,
+                    rel_mem=rel_mem,
+                    enabled=bool(query_residual_enabled),
+                    alpha=float(query_residual_alpha),
+                    mode=str(query_residual_mode),
+                )
 
             cmax = max(len(x) for x in puzs)
             B = len(batch)
@@ -721,6 +780,9 @@ def evaluate_relation_beam(
     eval_pred_topk: int = 1,
     eval_use_halt: bool = False,
     eval_min_hops_before_stop: int = 1,
+    query_residual_enabled: bool = False,
+    query_residual_alpha: float = 0.0,
+    query_residual_mode: str = "sub_rel",
     entity_labels: Optional[List[str]] = None,
     relation_labels: Optional[List[str]] = None,
 ):
@@ -816,7 +878,16 @@ def evaluate_relation_beam(
         beams = []
         for s in starts:
             init_carry = carry_init_fn({'input_ids': q_toks['input_ids']}, device)
-            beams.append({'score': 0.0, 'nodes': [int(s)], 'rels': [], 'carry': init_carry, 'stopped': False})
+            beams.append(
+                {
+                    'score': 0.0,
+                    'nodes': [int(s)],
+                    'rels': [],
+                    'carry': init_carry,
+                    'q_emb': np.asarray(q_emb, dtype=np.float32).copy(),
+                    'stopped': False,
+                }
+            )
 
         beams = beams[:max(1, beam)]
 
@@ -850,7 +921,7 @@ def evaluate_relation_beam(
                     continue
                 rel_cands = _select_rel_candidates(
                     rel_to_nodes=rel_to_nodes,
-                    q_emb=q_emb,
+                    q_emb=np.asarray(b.get('q_emb', q_emb), dtype=np.float32),
                     rel_mem=rel_mem,
                     max_relations=int(max_neighbors),
                     prune_keep=int(prune_keep),
@@ -889,12 +960,21 @@ def evaluate_relation_beam(
                         'nodes': list(b['nodes']),
                         'rels': list(b['rels']),
                         'carry': _clone_carry(next_carry),
+                        'q_emb': np.asarray(b.get('q_emb', q_emb), dtype=np.float32).copy(),
                         'stopped': True,
                     })
                 topk = min(max(1, beam), len(rel_cands))
                 topv, topi = torch.topk(logp, k=topk)
                 for v, i in zip(topv.tolist(), topi.tolist()):
                     r_sel = int(rel_cands[int(i)])
+                    q_next = _apply_query_residual_np(
+                        q_emb=np.asarray(b.get('q_emb', q_emb), dtype=np.float32),
+                        rel_id=r_sel,
+                        rel_mem=rel_mem,
+                        enabled=bool(query_residual_enabled),
+                        alpha=float(query_residual_alpha),
+                        mode=str(query_residual_mode),
+                    )
                     next_nodes = rel_to_nodes.get(r_sel, [])
                     if not next_nodes:
                         if no_cycle:
@@ -904,6 +984,7 @@ def evaluate_relation_beam(
                             'nodes': list(b['nodes']),
                             'rels': list(b['rels']) + [r_sel],
                             'carry': _clone_carry(next_carry),
+                            'q_emb': np.asarray(q_next, dtype=np.float32).copy(),
                             'stopped': False,
                         })
                     else:
@@ -913,6 +994,7 @@ def evaluate_relation_beam(
                                 'nodes': list(b['nodes']) + [int(nxt)],
                                 'rels': list(b['rels']) + [r_sel],
                                 'carry': _clone_carry(next_carry),
+                                'q_emb': np.asarray(q_next, dtype=np.float32).copy(),
                                 'stopped': False,
                             })
 
@@ -1184,6 +1266,9 @@ def train(args):
     train_sanity_eval_use_halt = _as_bool(getattr(args, 'train_sanity_eval_use_halt', False))
     train_sanity_eval_max_neighbors = int(getattr(args, 'train_sanity_eval_max_neighbors', getattr(args, 'eval_max_neighbors', args.max_neighbors)))
     train_sanity_eval_prune_keep = int(getattr(args, 'train_sanity_eval_prune_keep', getattr(args, 'eval_prune_keep', args.prune_keep)))
+    query_residual_enabled = _as_bool(getattr(args, 'query_residual_enabled', False))
+    query_residual_alpha = float(getattr(args, 'query_residual_alpha', 0.0))
+    query_residual_mode = str(getattr(args, 'query_residual_mode', 'sub_rel')).strip().lower()
     if train_sanity_eval_every_pct < 0:
         train_sanity_eval_every_pct = 0
     if train_sanity_eval_limit < 0:
@@ -1217,6 +1302,9 @@ def train(args):
         args.max_steps,
         endpoint_aux=True,
         entity_vocab_size=int(ent_mem.shape[0]),
+        query_residual_enabled=query_residual_enabled,
+        query_residual_alpha=query_residual_alpha,
+        query_residual_mode=query_residual_mode,
     )
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=args.num_workers, drop_last=True, collate_fn=collate, pin_memory=torch.cuda.is_available(), persistent_workers=(args.num_workers > 0))
@@ -1250,11 +1338,15 @@ def train(args):
         no_cycle: bool,
         temperature: float,
         with_grad: bool,
+        query_residual_enabled: bool = False,
+        query_residual_alpha: float = 0.0,
+        query_residual_mode: str = "sub_rel",
     ):
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         with ctx:
             carry_1 = carry_init_fn({'input_ids': input_ids_1}, device)
             cur = int(start_node)
+            q_emb_cur = np.asarray(q_emb_np, dtype=np.float32)
             visited = {cur}
             logprob_sum = torch.zeros((), device=device, requires_grad=with_grad)
             entropy_sum = torch.zeros((), device=device, requires_grad=with_grad)
@@ -1268,7 +1360,7 @@ def train(args):
                 rel_to_nodes = _build_rel_to_nodes(edges)
                 rel_cands = _select_rel_candidates(
                     rel_to_nodes=rel_to_nodes,
-                    q_emb=q_emb_np,
+                    q_emb=q_emb_cur,
                     rel_mem=rel_mem,
                     max_relations=int(args.max_neighbors),
                     prune_keep=int(args.prune_keep),
@@ -1303,6 +1395,14 @@ def train(args):
                     idx = int(torch.argmax(logp_1).item())
                 logprob_sum = logprob_sum + logp_1[idx]
                 r_sel = int(rel_cands[idx])
+                q_emb_cur = _apply_query_residual_np(
+                    q_emb=q_emb_cur,
+                    rel_id=r_sel,
+                    rel_mem=rel_mem,
+                    enabled=bool(query_residual_enabled),
+                    alpha=float(query_residual_alpha),
+                    mode=str(query_residual_mode),
+                )
                 next_nodes = rel_to_nodes.get(r_sel, [])
                 if not next_nodes:
                     break
@@ -1528,6 +1628,9 @@ def train(args):
                         no_cycle=phase2_rl_no_cycle,
                         temperature=phase2_rl_sample_temp,
                         with_grad=True,
+                        query_residual_enabled=query_residual_enabled,
+                        query_residual_alpha=query_residual_alpha,
+                        query_residual_mode=query_residual_mode,
                     )
                     r_s = _rl_reward_from_pred(pred_s, gold_set_i, phase2_rl_reward_metric)
                     if phase2_rl_use_greedy_baseline:
@@ -1541,6 +1644,9 @@ def train(args):
                             no_cycle=phase2_rl_no_cycle,
                             temperature=1.0,
                             with_grad=False,
+                            query_residual_enabled=query_residual_enabled,
+                            query_residual_alpha=query_residual_alpha,
+                            query_residual_mode=query_residual_mode,
                         )
                         r_g = _rl_reward_from_pred(pred_g, gold_set_i, phase2_rl_reward_metric)
                     else:
@@ -1766,6 +1872,9 @@ def train(args):
                         eval_pred_topk=int(max(1, train_sanity_eval_pred_topk)),
                         eval_use_halt=bool(train_sanity_eval_use_halt),
                         eval_min_hops_before_stop=int(getattr(args, 'eval_min_hops_before_stop', 1)),
+                        query_residual_enabled=bool(query_residual_enabled),
+                        query_residual_alpha=float(query_residual_alpha),
+                        query_residual_mode=str(query_residual_mode),
                         entity_labels=None,
                         relation_labels=None,
                     )
@@ -1857,6 +1966,9 @@ def train(args):
                     eval_pred_topk=int(getattr(args, 'eval_pred_topk', 1)),
                     eval_use_halt=bool(getattr(args, 'eval_use_halt', False)),
                     eval_min_hops_before_stop=int(getattr(args, 'eval_min_hops_before_stop', 1)),
+                    query_residual_enabled=bool(query_residual_enabled),
+                    query_residual_alpha=float(query_residual_alpha),
+                    query_residual_mode=str(query_residual_mode),
                     entity_labels=entity_labels,
                     relation_labels=relation_labels,
                 )
@@ -2041,6 +2153,9 @@ def test(args):
             eval_pred_topk=int(getattr(args, 'eval_pred_topk', 1)),
             eval_use_halt=bool(getattr(args, 'eval_use_halt', False)),
             eval_min_hops_before_stop=int(getattr(args, 'eval_min_hops_before_stop', 1)),
+            query_residual_enabled=bool(getattr(args, 'query_residual_enabled', False)),
+            query_residual_alpha=float(getattr(args, 'query_residual_alpha', 0.0)),
+            query_residual_mode=str(getattr(args, 'query_residual_mode', 'sub_rel')),
             entity_labels=entity_labels,
             relation_labels=relation_labels,
         )

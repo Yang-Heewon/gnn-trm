@@ -1,7 +1,7 @@
 {
   "train_in": "data/CWQ/train_split.jsonl",
   "dev_in": "data/CWQ/dev_split.jsonl",
-  "test_in": "data/data/CWQ/test.json",
-  "entities_txt": "data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt",
-  "relations_txt": "data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
+  "test_in": "data/CWQ/test_split.jsonl",
+  "entities_txt": "data/CWQ/entities.txt",
+  "relations_txt": "data/CWQ/relations.txt"
 }
