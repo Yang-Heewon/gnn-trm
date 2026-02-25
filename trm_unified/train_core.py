@@ -3,6 +3,7 @@ import math
 import os
 import re
 import json
+import random
 from datetime import timedelta
 from collections import deque
 from typing import Dict, List, Optional
@@ -19,6 +20,22 @@ from tqdm import tqdm
 
 from .data import build_adj_from_tuples, iter_json_records, load_kb_map, load_rel_map, read_jsonl_by_offset, build_line_offsets
 from .tokenization import load_tokenizer
+
+
+def _set_global_seed(seed: int, deterministic: bool = False):
+    s = int(seed)
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
 
 
 def _setup_wandb(args, is_main: bool):
@@ -160,16 +177,39 @@ def _apply_query_residual_np(
     return _l2_normalize_np(out)
 
 
+def _infer_vocab_size_from_state_dict(sd: dict) -> Optional[int]:
+    if not isinstance(sd, dict):
+        return None
+    cand_keys = [
+        "inner.embed_tokens.embedding_weight",
+        "module.inner.embed_tokens.embedding_weight",
+        "inner.lm_head.weight",
+        "module.inner.lm_head.weight",
+    ]
+    for k in cand_keys:
+        v = sd.get(k, None)
+        if hasattr(v, "shape") and len(v.shape) >= 2:
+            try:
+                return int(v.shape[0])
+            except Exception:
+                continue
+    return None
+
+
 class PathDataset(Dataset):
-    def __init__(self, jsonl_path: str, max_steps: int):
+    def __init__(self, jsonl_path: str, max_steps: int, min_path_hops: int = 1):
         self.jsonl_path = jsonl_path
         self.max_steps = max_steps
+        self.min_path_hops = max(1, int(min_path_hops))
         self.offsets = build_line_offsets(jsonl_path, is_main=True)
         self.flat = []
         for i in tqdm(range(len(self.offsets)), desc='Flattening'):
             ex = read_jsonl_by_offset(self.jsonl_path, self.offsets, i)
             vps = ex.get('valid_paths', [])
-            for pidx in range(len(vps)):
+            for pidx, p in enumerate(vps):
+                if self.min_path_hops > 1:
+                    if (not isinstance(p, list)) or (len(p) < self.min_path_hops):
+                        continue
                 self.flat.append((i, pidx))
 
     def __len__(self):
@@ -294,6 +334,7 @@ def make_collate(
             sample_ctx.append(
                 {
                     'adj': adj,
+                    'q_emb_init': np.asarray(q_emb, dtype=np.float32).copy(),
                     'q_emb': q_emb,
                     'gold_set': gold_set,
                     'reach_memo': {},
@@ -410,7 +451,12 @@ def make_collate(
             seq_batches[t]['halt_targets'] = halt_targets
             seq_batches[t]['halt_mask'] = halt_mask
 
-        rl_q = np.stack([ctx['q_emb'] for ctx in sample_ctx], axis=0).astype(np.float32)
+        # For RL/SCST rollouts, start from the original query embedding.
+        # Using teacher-forced residual-updated q_emb leaks gold-path information.
+        rl_q = np.stack(
+            [ctx.get('q_emb_init', ctx['q_emb']) for ctx in sample_ctx],
+            axis=0,
+        ).astype(np.float32)
         rl_starts = []
         rl_gold = []
         rl_tuples = []
@@ -785,6 +831,9 @@ def evaluate_relation_beam(
     query_residual_mode: str = "sub_rel",
     entity_labels: Optional[List[str]] = None,
     relation_labels: Optional[List[str]] = None,
+    eval_dump_jsonl: str = "",
+    eval_random_sample_size: int = 0,
+    eval_random_seed: int = 42,
 ):
     model.eval()
     tok = load_tokenizer(tokenizer_name)
@@ -808,10 +857,22 @@ def evaluate_relation_beam(
         )
 
     data = list(iter_json_records(eval_json))
-    total = len(data) if eval_limit < 0 else min(len(data), eval_limit)
-    if total > int(q_mem.shape[0]):
+    n_data = int(len(data))
+    rand_n = int(max(0, int(eval_random_sample_size)))
+    if rand_n > 0:
+        k = min(n_data, rand_n)
+        rng = np.random.default_rng(int(eval_random_seed))
+        eval_indices = rng.choice(n_data, size=k, replace=False).astype(np.int64).tolist()
+    else:
+        total_seq = n_data if eval_limit < 0 else min(n_data, int(eval_limit))
+        eval_indices = list(range(total_seq))
+    total = int(len(eval_indices))
+    if total <= 0:
+        return 0.0, 0.0, 0
+    max_qi = int(max(eval_indices))
+    if max_qi >= int(q_mem.shape[0]):
         raise RuntimeError(
-            f"query embedding rows mismatch: eval_examples={total}, q_mem_rows={int(q_mem.shape[0])}, "
+            f"query embedding rows mismatch: max_eval_index={max_qi}, q_mem_rows={int(q_mem.shape[0])}, "
             f"eval_json={eval_json}, q_npy={q_npy}. "
             "Use query_dev.npy for dev eval and query_test.npy for test eval."
         )
@@ -821,6 +882,12 @@ def evaluate_relation_beam(
     debugged = 0
     pred_topk = max(1, int(eval_pred_topk))
     min_hops_before_stop = max(0, int(eval_min_hops_before_stop))
+    dump_fp = None
+    if eval_dump_jsonl:
+        dump_dir = os.path.dirname(str(eval_dump_jsonl))
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        dump_fp = open(eval_dump_jsonl, "w", encoding="utf-8")
 
     entity_vocab_size = None
     try:
@@ -852,7 +919,8 @@ def evaluate_relation_beam(
                 break
         return out
 
-    for ex_idx in tqdm(range(total), desc='Eval'):
+    for eval_pos in tqdm(range(total), desc='Eval'):
+        ex_idx = int(eval_indices[eval_pos])
         ex = data[ex_idx]
         tuples, starts_raw, gold = _parse_eval_example(ex, kb2idx, rel2idx)
         adj = build_adj_from_tuples(tuples)
@@ -1013,16 +1081,51 @@ def evaluate_relation_beam(
         pred = int(best['nodes'][-1])
         pred_entities = _top_pred_entities(beams, pred_topk)
         pred_set = set(pred_entities)
+        gold_path = None
         if gold:
             h = 1.0 if pred in gold else 0.0
             hit1.append(h)
             inter = len(pred_set & gold)
             if inter == 0:
-                f1s.append(0.0)
+                f1_i = 0.0
+                f1s.append(f1_i)
             else:
                 precision = inter / max(1, len(pred_set))
                 recall = inter / max(1, len(gold))
-                f1s.append((2.0 * precision * recall) / max(1e-12, precision + recall))
+                f1_i = (2.0 * precision * recall) / max(1e-12, precision + recall)
+                f1s.append(f1_i)
+            if dump_fp is not None or debugged < max(0, debug_n):
+                gold_path = _find_gold_path(adj, starts_raw, gold, max_steps=max_steps)
+            if dump_fp is not None:
+                rec = {
+                    "index": int(ex_idx),
+                    "question": ex.get("question", ""),
+                    "hit1": float(h),
+                    "f1": float(f1_i),
+                    "pred_entity": int(pred),
+                    "pred_top_entities": [int(x) for x in pred_entities],
+                    "pred_path_nodes": [int(x) for x in best.get("nodes", [])],
+                    "pred_path_relations": [int(x) for x in best.get("rels", [])],
+                    "pred_path_hops": int(len(best.get("rels", []))),
+                    "gold_entities": sorted(int(x) for x in gold),
+                    "num_gold": int(len(gold)),
+                    "gold_path_hops_within_max_steps": (
+                        int(len(gold_path.get("rels", []))) if gold_path is not None else None
+                    ),
+                    "gold_reachable_within_max_steps": bool(gold_path is not None),
+                    "first_pred_relation": (
+                        int(best.get("rels", [])[0]) if len(best.get("rels", [])) > 0 else None
+                    ),
+                    "first_pred_relation_text": (
+                        _idx_to_label(relation_labels, best.get("rels", [])[0])
+                        if relation_labels and len(best.get("rels", [])) > 0
+                        else None
+                    ),
+                    "pred_entity_text": (
+                        _idx_to_label(entity_labels, pred) if entity_labels else str(pred)
+                    ),
+                }
+                dump_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
         if debugged < max(0, debug_n):
             debugged += 1
@@ -1042,7 +1145,8 @@ def evaluate_relation_beam(
             if entity_labels:
                 pred_top_txt = ' | '.join(_idx_to_label(entity_labels, x) for x in pred_entities)
                 print(f"  pred_top{pred_topk}_text: {pred_top_txt}")
-            gold_path = _find_gold_path(adj, starts_raw, gold, max_steps=max_steps)
+            if gold_path is None:
+                gold_path = _find_gold_path(adj, starts_raw, gold, max_steps=max_steps)
             if gold_path is None:
                 print("  gold_path: <not found within max_steps>")
             else:
@@ -1057,6 +1161,8 @@ def evaluate_relation_beam(
                     g_node_txt = ' -> '.join(_idx_to_label(entity_labels, x) for x in gold_path["nodes"])
                     print(f"  gold_node_text_path: {g_node_txt}")
 
+    if dump_fp is not None:
+        dump_fp.close()
     m_hit = float(np.mean(hit1)) if hit1 else 0.0
     m_f1 = float(np.mean(f1s)) if f1s else 0.0
     return m_hit, m_f1, skip
@@ -1065,7 +1171,39 @@ def evaluate_relation_beam(
 def train(args):
     is_ddp, rank, local_rank, world_size, device = _setup_ddp()
     is_main = rank == 0
+    base_seed = int(getattr(args, "seed", 42))
+    det = bool(getattr(args, "deterministic", False))
+    seed_this_rank = int(base_seed + rank)
+    _set_global_seed(seed_this_rank, deterministic=det)
+    if is_main:
+        print(
+            f"[Reproducibility] seed={base_seed} per_rank_seed=seed+rank deterministic={det}"
+        )
     wb = _setup_wandb(args, is_main)
+    subgraph_reader_enabled = str(getattr(args, "subgraph_reader_enabled", False)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if subgraph_reader_enabled:
+        from .subgraph_reader import train_subgraph_reader
+
+        train_subgraph_reader(
+            args,
+            is_ddp=is_ddp,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            device=device,
+            wb=wb,
+        )
+        if is_ddp:
+            dist.destroy_process_group()
+        if wb is not None:
+            wb.finish()
+        return
 
     # Full-dev evaluation on rank0 while other DDP ranks wait at barrier can
     # hit process-group timeout when eval_limit=-1 and timeout is too small.
@@ -1086,11 +1224,24 @@ def train(args):
     tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
+    preloaded_sd = None
+    ckpt_vocab_size = None
+    if args.ckpt and os.path.exists(args.ckpt):
+        preloaded_sd = torch.load(args.ckpt, map_location='cpu')
+        ckpt_vocab_size = _infer_vocab_size_from_state_dict(preloaded_sd)
+    vocab_size = int(tok.vocab_size)
+    if ckpt_vocab_size is not None and int(ckpt_vocab_size) > 0 and int(ckpt_vocab_size) != int(vocab_size):
+        if is_main:
+            print(
+                f"[warn] tokenizer vocab_size({vocab_size}) != ckpt vocab_size({int(ckpt_vocab_size)}); "
+                "using ckpt vocab_size for model build."
+            )
+        vocab_size = int(ckpt_vocab_size)
 
     cfg = {
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
-        'vocab_size': tok.vocab_size,
+        'vocab_size': vocab_size,
         'hidden_size': args.hidden_size,
         'num_heads': args.num_heads,
         'expansion': args.expansion,
@@ -1118,9 +1269,8 @@ def train(args):
         for p in model.inner.lm_head.parameters():
             p.requires_grad = False
 
-    if args.ckpt and os.path.exists(args.ckpt):
-        sd = torch.load(args.ckpt, map_location='cpu')
-        model.load_state_dict(sd, strict=False)
+    if preloaded_sd is not None:
+        model.load_state_dict(preloaded_sd, strict=False)
 
     model.to(device)
     if is_ddp:
@@ -1186,7 +1336,16 @@ def train(args):
             wb.finish()
         return
 
-    ds = PathDataset(args.train_json, args.max_steps)
+    train_min_path_hops = max(1, int(getattr(args, 'train_min_path_hops', 1)))
+    ds = PathDataset(args.train_json, args.max_steps, min_path_hops=train_min_path_hops)
+    if len(ds) <= 0:
+        raise RuntimeError(
+            f"Empty supervised dataset after flattening paths: train_json={args.train_json}, "
+            f"max_steps={int(args.max_steps)}, train_min_path_hops={int(train_min_path_hops)}. "
+            "Lower train_min_path_hops, increase max_steps, or rebuild preprocessing with richer valid_paths."
+        )
+    if is_main and train_min_path_hops > 1:
+        print(f"[TrainData] min_path_hops={train_min_path_hops} (short paths are skipped in supervised dataset)")
 
     def _parse_optional_float(v):
         if v is None:
@@ -1269,6 +1428,9 @@ def train(args):
     query_residual_enabled = _as_bool(getattr(args, 'query_residual_enabled', False))
     query_residual_alpha = float(getattr(args, 'query_residual_alpha', 0.0))
     query_residual_mode = str(getattr(args, 'query_residual_mode', 'sub_rel')).strip().lower()
+    eval_random_sample_size = int(getattr(args, 'eval_random_sample_size', 0))
+    eval_random_seed = int(getattr(args, 'eval_random_seed', 42))
+    eval_random_resample_each_eval = _as_bool(getattr(args, 'eval_random_resample_each_eval', False))
     if train_sanity_eval_every_pct < 0:
         train_sanity_eval_every_pct = 0
     if train_sanity_eval_limit < 0:
@@ -1308,6 +1470,11 @@ def train(args):
     )
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=args.num_workers, drop_last=True, collate_fn=collate, pin_memory=torch.cuda.is_available(), persistent_workers=(args.num_workers > 0))
+    if len(loader) <= 0:
+        raise RuntimeError(
+            f"Empty training loader: dataset_size={len(ds)}, batch_size={int(args.batch_size)}, drop_last=True. "
+            "Reduce batch_size or adjust train_min_path_hops/preprocessing."
+        )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr)
@@ -1877,6 +2044,8 @@ def train(args):
                         query_residual_mode=str(query_residual_mode),
                         entity_labels=None,
                         relation_labels=None,
+                        eval_random_sample_size=0,
+                        eval_random_seed=42,
                     )
                     print(
                         f"[TrainSanity] ep={ep} step={steps}/{len(loader)} "
@@ -1971,6 +2140,10 @@ def train(args):
                     query_residual_mode=str(query_residual_mode),
                     entity_labels=entity_labels,
                     relation_labels=relation_labels,
+                    eval_random_sample_size=int(eval_random_sample_size),
+                    eval_random_seed=int(
+                        eval_random_seed + (ep if eval_random_resample_each_eval else 0)
+                    ),
                 )
                 print(f'[Dev] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')
                 dev_hit1 = float(mh)
@@ -2082,11 +2255,33 @@ def train(args):
 
 
 def test(args):
+    subgraph_reader_enabled = str(getattr(args, "subgraph_reader_enabled", False)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if subgraph_reader_enabled:
+        from .subgraph_reader import test_subgraph_reader
+
+        test_subgraph_reader(args)
+        return
+
     # Full relation-path beam traversal evaluation:
     # start-entity -> predicted end-entity, measured by Hit@1/F1.
     tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
+    sd = torch.load(args.ckpt, map_location='cpu')
+    ckpt_vocab_size = _infer_vocab_size_from_state_dict(sd)
+    vocab_size = int(tok.vocab_size)
+    if ckpt_vocab_size is not None and int(ckpt_vocab_size) > 0 and int(ckpt_vocab_size) != int(vocab_size):
+        print(
+            f"[warn] tokenizer vocab_size({vocab_size}) != ckpt vocab_size({int(ckpt_vocab_size)}); "
+            "using ckpt vocab_size for model build."
+        )
+        vocab_size = int(ckpt_vocab_size)
     kb2idx = load_kb_map(args.entities_txt)
     rel2idx = load_rel_map(args.relations_txt)
     entity_labels = _load_entity_labels(args.entities_txt, getattr(args, 'entity_names_json', ''))
@@ -2094,7 +2289,7 @@ def test(args):
     cfg = {
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
-        'vocab_size': tok.vocab_size,
+        'vocab_size': vocab_size,
         'hidden_size': args.hidden_size,
         'num_heads': args.num_heads,
         'expansion': args.expansion,
@@ -2117,7 +2312,6 @@ def test(args):
     model, _ = build_model(args.model_impl, args.trm_root, cfg)
     model.inner.puzzle_emb_data = ent_mem
     model.inner.relation_emb_data = rel_mem
-    sd = torch.load(args.ckpt, map_location='cpu')
     model.load_state_dict(sd, strict=False)
     model.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     dev = next(model.parameters()).device
@@ -2158,5 +2352,8 @@ def test(args):
             query_residual_mode=str(getattr(args, 'query_residual_mode', 'sub_rel')),
             entity_labels=entity_labels,
             relation_labels=relation_labels,
+            eval_dump_jsonl=str(getattr(args, 'eval_dump_jsonl', '')),
+            eval_random_sample_size=int(getattr(args, 'eval_random_sample_size', 0)),
+            eval_random_seed=int(getattr(args, 'eval_random_seed', 42)),
         )
         print(f'[Test] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')

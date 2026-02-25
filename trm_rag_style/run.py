@@ -1,4 +1,5 @@
 import os
+import re
 
 from .config_utils import build_parser, load_run_config
 from .trm_pipeline import preprocess as trm_pre
@@ -14,6 +15,18 @@ def _resolve_path(base_dir, raw):
     if os.path.isabs(p):
         return p
     return os.path.abspath(os.path.join(base_dir, p))
+
+
+def _infer_resume_epoch_from_ckpt(ckpt_path: str) -> int:
+    if not ckpt_path:
+        return 0
+    m = re.search(r"model_ep(\d+)\.pt$", os.path.basename(str(ckpt_path)))
+    if not m:
+        return 0
+    try:
+        return max(0, int(m.group(1)))
+    except Exception:
+        return 0
 
 
 def normalize_config_paths(cfg):
@@ -135,6 +148,30 @@ def main():
     if stage in {'train', 'all'}:
         os.makedirs(cfg['ckpt_dir'], exist_ok=True)
         trm_train.run(cfg)
+        auto_test_after_train = str(cfg.get('auto_test_after_train', False)).strip().lower() in {
+            '1', 'true', 'yes', 'y', 'on'
+        }
+        if auto_test_after_train:
+            last_ep = int(cfg.get('epochs', 1))
+            subgraph_enabled = str(cfg.get('subgraph_reader_enabled', False)).strip().lower() in {
+                '1', 'true', 'yes', 'y', 'on'
+            }
+            if subgraph_enabled:
+                try:
+                    resume_ep = int(cfg.get('subgraph_resume_epoch', -1))
+                except Exception:
+                    resume_ep = -1
+                if resume_ep < 0:
+                    resume_ep = _infer_resume_epoch_from_ckpt(cfg.get('ckpt', ''))
+                last_ep += max(0, int(resume_ep))
+            ckpt_path = os.path.join(cfg['ckpt_dir'], f'model_ep{last_ep}.pt')
+            if not os.path.exists(ckpt_path):
+                print(f"[warn] auto_test_after_train enabled but checkpoint not found: {ckpt_path}")
+            else:
+                test_cfg = dict(cfg)
+                test_cfg['ckpt'] = ckpt_path
+                print(f"[AutoTest] run test with {ckpt_path}")
+                trm_test.run(test_cfg)
 
     if stage == 'test':
         if not cfg.get('ckpt'):

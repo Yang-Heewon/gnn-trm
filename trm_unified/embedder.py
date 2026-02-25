@@ -171,7 +171,7 @@ def encode_texts(
             mdl = torch.nn.DataParallel(mdl, device_ids=gpu_ids, output_device=gpu_ids[0])
     except Exception as e:
         raise RuntimeError(
-            f"failed to load embedding model '{model_name}' with backend='{embed_backend}' "
+            f"failed to load embedding model '{model_name}' with backend='{selected_backend}' "
             f"(device='{run_device}'): {e}. "
             "Install/check model dependencies or set an explicit valid model name."
         ) from e
