@@ -8,7 +8,7 @@ source "$REPO_ROOT/scripts/lib/portable_env.sh"
 PYTHON_BIN="$(require_python_bin)"
 cd "$REPO_ROOT"
 
-DATASET="${DATASET:-webqsp}" # cwq | webqsp | all
+DATASET="${DATASET:-cwq}" # cwq | webqsp | all
 if [ "$DATASET" != "cwq" ] && [ "$DATASET" != "webqsp" ] && [ "$DATASET" != "all" ]; then
   echo "[err] DATASET must be cwq, webqsp, or all (got: $DATASET)"
   exit 2
@@ -29,6 +29,8 @@ MAX_STEPS="${MAX_STEPS:-4}"
 MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
 PREPROCESS_WORKERS="${PREPROCESS_WORKERS:-0}"
+TRAIN_PATH_POLICY="${TRAIN_PATH_POLICY:-all}"
+TRAIN_SHORTEST_K="${TRAIN_SHORTEST_K:-1}"
 
 TARGET_DATASETS=()
 if [ "$DATASET" = "all" ]; then
@@ -86,6 +88,8 @@ for ds in "${TARGET_DATASETS[@]}"; do
         max_paths="$MAX_PATHS" \
         mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
         preprocess_workers="$PREPROCESS_WORKERS" \
+        train_path_policy="$TRAIN_PATH_POLICY" \
+        train_shortest_k="$TRAIN_SHORTEST_K" \
         "${COMMON_OVR[@]}"
   fi
 

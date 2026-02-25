@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-DATASET="${DATASET:-webqsp}" # cwq | webqsp | all
+DATASET="${DATASET:-cwq}" # cwq | webqsp | all
 DATA_SOURCE="${DATA_SOURCE:-rog_hf}"
 CWQ_VOCAB_ONLY="${CWQ_VOCAB_ONLY:-0}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-}"

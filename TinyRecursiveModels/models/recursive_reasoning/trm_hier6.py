@@ -73,14 +73,14 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         self.mlp = SwiGLU(hidden_size=config.hidden_size, expansion=config.expansion)
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         if self.config.mlp_t:
             hidden_states = hidden_states.transpose(1,2)
             out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1,2)
         else:
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attention_mask=attention_mask), variance_epsilon=self.norm_eps)
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
@@ -106,7 +106,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.node_cls_head = CastedLinear(self.config.hidden_size, 1, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
 
         # [수정 1] 데이터 그릇 초기화 (파일 로딩 삭제)
@@ -132,7 +132,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 self.relation_projector = None
 
         # [수정 4] Score Head 추가 (Ranking 점수 계산용)
-        self.score_proj = nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=False).to(self.forward_dtype)
+        self.score_proj = None
 
         # --- RoPE ---
         if self.config.pos_encodings == "rope":
@@ -152,8 +152,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.L6_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=0.02), persistent=True)
 
         with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)
+            self.node_cls_head.weight.zero_()
+            self.node_cls_head.bias.fill_(-5)
 
     # trm_hier6.py 내 TinyRecursiveReasoningModel_ACTV1_Inner 클래스 내부
 
@@ -355,10 +355,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
 
         output = self.lm_head(z_H)
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        node_logits = self.node_cls_head(z_H).squeeze(-1).to(torch.float32)
 
         # ✅ z_H_last 추가로 반환
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), z_H_last
+        return new_carry, output, node_logits, z_H_last
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def __init__(self, config_dict: dict):
@@ -386,12 +386,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         current_data_sync = {k: v.to(device) for k, v in carry.current_data.items()}
 
         # 현재 seq_len 계산
+        P_len = batch["puzzle_identifiers"].shape[1] if "puzzle_identifiers" in batch else self.inner.puzzle_emb_len
         if "input_ids" in batch:
-            current_seq_len = batch["input_ids"].shape[1] + self.inner.puzzle_emb_len
+            current_seq_len = batch["input_ids"].shape[1] + P_len
         elif "inputs" in batch:
-            current_seq_len = batch["inputs"].shape[1] + self.inner.puzzle_emb_len
+            current_seq_len = batch["inputs"].shape[1] + P_len
         else:
-            current_seq_len = self.config.seq_len + self.inner.puzzle_emb_len
+            current_seq_len = self.config.seq_len + P_len
 
         # ✅ 1) new_inner_carry 먼저 정의
         new_inner_carry = self.inner.reset_carry(halted_sync, carry.inner_carry, target_seq_len=current_seq_len)
@@ -414,45 +415,19 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         elif "inputs" in batch: new_current_data["inputs"] = batch["inputs"]
 
         # ✅ 4) 이제 inner 호출 (여기서 z_H_last도 받음)
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), z_H_last = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, node_logits, z_H_last = self.inner(new_inner_carry, new_current_data)
 
-        # ✅ 5) scoring은 z_H_last로
-        query = z_H_last[:, 0, :]
-        if hasattr(self.inner, "score_proj") and self.inner.score_proj is not None:
-            query = self.inner.score_proj(query)
-
-        p_ids = new_current_data["puzzle_identifiers"]
-        r_ids = new_current_data["relation_identifiers"]
-
-        c_ent = self.inner.puzzle_emb_lookup(p_ids)
-        c_rel = self.inner.relation_emb_lookup(r_ids)
-        candidates = c_ent + c_rel
-
-        scores = torch.bmm(query.unsqueeze(1), candidates.transpose(1, 2)).squeeze(1)
-        scores = scores / math.sqrt(self.config.hidden_size) # ✅ 폭발 방지 안전장치
-
+        # 서브그래프 토큰들에 대한 독립적인 BCE 예측
+        # Nodes are concatenated BEFORE text queries in _input_embeddings
+        P_len = new_current_data["puzzle_identifiers"].shape[1] if "puzzle_identifiers" in new_current_data else self.inner.puzzle_emb_len
         outputs = {
             "logits": logits,
-            "scores": scores,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits,
+            "scores": node_logits[:, :P_len],
         }
 
-        # ✅ 6) step update (그대로 유지 가능)
+        # ✅ 6) step update (1-step forward only)
         with torch.no_grad():
             new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            halted = is_last_step
-
-            if self.training and (self.config.halt_max_steps > 1):
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
-
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(
-                    new_steps, low=2, high=self.config.halt_max_steps + 1
-                )
-                halted = halted & (new_steps >= min_halt_steps)
+            halted = torch.ones_like(halted_sync)
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
