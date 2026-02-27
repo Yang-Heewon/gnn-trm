@@ -239,6 +239,7 @@ class SubgraphCollator:
     def __call__(self, batch: List[dict]) -> dict:
         node_emb_list = []
         node_mask_list = []
+        seed_mask_list = []
         node_label_list = []
         node_cids_list = []
         edge_src_list = []
@@ -274,6 +275,11 @@ class SubgraphCollator:
             max_e = max(max_e, e)
 
             node_emb = self._gather_entity_emb(node_cids)
+            seed_set = set(int(x) for x in seeds)
+            seed_mask = np.asarray([int(nid) in seed_set for nid in node_cids], dtype=np.bool_)
+            # Fallback for malformed examples where no seed survives subgraph crop.
+            if not bool(seed_mask.any()) and n > 0:
+                seed_mask[0] = True
             gold_set = set(int(x) for x in gold)
             node_lbl = np.asarray([1.0 if int(nid) in gold_set else 0.0 for nid in node_cids], dtype=np.float32)
 
@@ -302,6 +308,7 @@ class SubgraphCollator:
 
             node_emb_list.append(node_emb)
             node_mask_list.append(np.ones((n,), dtype=np.bool_))
+            seed_mask_list.append(seed_mask)
             node_label_list.append(node_lbl)
             node_cids_list.append(np.asarray(node_cids, dtype=np.int64))
             edge_src_list.append(edge_src)
@@ -316,6 +323,7 @@ class SubgraphCollator:
         bsz = len(batch)
         node_emb_t = torch.zeros((bsz, max_n, self.entity_dim), dtype=torch.float32)
         node_mask_t = torch.zeros((bsz, max_n), dtype=torch.bool)
+        seed_mask_t = torch.zeros((bsz, max_n), dtype=torch.bool)
         node_label_t = torch.zeros((bsz, max_n), dtype=torch.float32)
         node_cids_t = torch.full((bsz, max_n), -1, dtype=torch.long)
 
@@ -332,6 +340,7 @@ class SubgraphCollator:
             e = edge_rel_emb_list[i].shape[0]
             node_emb_t[i, :n] = torch.from_numpy(node_emb_list[i])
             node_mask_t[i, :n] = torch.from_numpy(node_mask_list[i])
+            seed_mask_t[i, :n] = torch.from_numpy(seed_mask_list[i])
             node_label_t[i, :n] = torch.from_numpy(node_label_list[i])
             node_cids_t[i, :n] = torch.from_numpy(node_cids_list[i])
             if e > 0:
@@ -345,6 +354,7 @@ class SubgraphCollator:
         return {
             "node_emb": node_emb_t,
             "node_mask": node_mask_t,
+            "seed_mask": seed_mask_t,
             "node_labels": node_label_t,
             "node_cids": node_cids_t,
             "edge_src": edge_src_t,
@@ -370,6 +380,9 @@ class RecursiveSubgraphReader(nn.Module):
         use_direction_embedding: bool = False,
         outer_reasoning_enabled: bool = False,
         outer_reasoning_steps: int = 3,
+        gnn_variant: str = "rearev_bfs",
+        rearev_num_instructions: int = 3,
+        rearev_adapt_stages: int = 1,
     ):
         super().__init__()
         self.entity_dim = int(entity_dim)
@@ -380,19 +393,33 @@ class RecursiveSubgraphReader(nn.Module):
         self.use_direction_embedding = bool(use_direction_embedding)
         self.outer_reasoning_enabled = bool(outer_reasoning_enabled)
         self.outer_reasoning_steps = max(1, int(outer_reasoning_steps))
+        variant = str(gnn_variant or "rearev_bfs").strip().lower()
+        if variant != "rearev_bfs":
+            raise ValueError(
+                f"Only rearev_bfs is supported in this build, got gnn_variant={variant!r}."
+            )
+        self.gnn_variant = variant
+        self.rearev_num_instructions = max(1, int(rearev_num_instructions))
+        self.rearev_adapt_stages = max(1, int(rearev_adapt_stages))
 
         self.node_proj = nn.Linear(self.entity_dim, self.hidden_size)
         self.rel_proj = nn.Linear(self.relation_dim, self.hidden_size)
         self.q_proj = nn.Linear(self.query_dim, self.hidden_size)
-        self.msg_mlp = nn.Sequential(
-            nn.Linear(self.hidden_size * 3, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        )
-        self.cell = nn.GRUCell(self.hidden_size, self.hidden_size)
+        # Baseline branch is intentionally disabled in this build.
+        self.msg_mlp = None
+        self.cell = None
         self.step_norm = nn.LayerNorm(self.hidden_size)
         self.dropout = nn.Dropout(float(dropout))
         self.out_head = nn.Linear(self.hidden_size, 1)
+        self.rearev_ins_proj = nn.Linear(self.hidden_size, self.hidden_size * self.rearev_num_instructions)
+        self.rearev_fuse = nn.Sequential(
+            nn.Linear(self.hidden_size * (1 + self.rearev_num_instructions), self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.rearev_cell = nn.GRUCell(self.hidden_size, self.hidden_size)
+        self.rearev_node_score = nn.Linear(self.hidden_size, 1)
+        self.rearev_ins_update = nn.GRUCell(self.hidden_size, self.hidden_size)
         if self.outer_reasoning_enabled:
             self.outer_state_update = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
@@ -411,26 +438,119 @@ class RecursiveSubgraphReader(nn.Module):
         n: int,
         e: int,
     ) -> torch.Tensor:
-        for _ in range(self.recursion_steps):
-            agg = torch.zeros_like(h)
-            if e > 0 and src is not None and dst is not None and rel_h is not None:
-                q_rep = q_inj.expand(e, -1)
-                msg_in = torch.cat([h[src], rel_h, q_rep], dim=-1)
-                msg = self.msg_mlp(msg_in)
-                agg.index_add_(0, dst, msg)
-                deg = torch.zeros((n,), dtype=h.dtype, device=h.device)
-                deg.index_add_(0, dst, ones)
-                agg = agg / deg.clamp(min=1.0).unsqueeze(-1)
-            agg = agg + 0.1 * h0
-            h = self.cell(agg, h)
-            h = self.step_norm(h)
-            h = self.dropout(h)
-        return h
+        raise RuntimeError("baseline recurrence is disabled; use gnn_variant='rearev_bfs'.")
+
+    def _seed_distribution(
+        self,
+        seed_mask: Optional[torch.Tensor],
+        n: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if seed_mask is None:
+            p = torch.zeros((n,), dtype=dtype, device=device)
+            p[0] = 1.0
+            return p
+        sm = seed_mask[:n].to(device=device)
+        p = sm.to(dtype=dtype)
+        denom = p.sum()
+        if float(denom.item()) <= 0.0:
+            p = torch.zeros((n,), dtype=dtype, device=device)
+            p[0] = 1.0
+            return p
+        return p / denom
+
+    def _inner_recur_rearev(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        src: Optional[torch.Tensor],
+        dst: Optional[torch.Tensor],
+        rel_h: Optional[torch.Tensor],
+        q_inj: torch.Tensor,
+        seed_mask: Optional[torch.Tensor],
+        n: int,
+        e: int,
+    ) -> torch.Tensor:
+        if (
+            self.rearev_ins_proj is None
+            or self.rearev_fuse is None
+            or self.rearev_cell is None
+            or self.rearev_node_score is None
+            or self.rearev_ins_update is None
+        ):
+            raise RuntimeError("rearev modules are not initialized for this gnn_variant.")
+        q_state = q_inj.squeeze(0)
+        ins = self.rearev_ins_proj(q_state).view(self.rearev_num_instructions, self.hidden_size)
+        h_stage = h
+        p_stage = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
+
+        for stage_idx in range(self.rearev_adapt_stages):
+            for _ in range(self.recursion_steps):
+                agg_per_ins: List[torch.Tensor] = []
+                if e > 0 and src is not None and dst is not None and rel_h is not None:
+                    src_prob = p_stage[src].unsqueeze(-1)
+                    for k in range(self.rearev_num_instructions):
+                        rel_cond = F.relu(rel_h * ins[k].unsqueeze(0))
+                        weighted = src_prob * rel_cond
+                        agg_k = torch.zeros_like(h_stage)
+                        agg_k.index_add_(0, dst, weighted)
+                        agg_per_ins.append(agg_k)
+                else:
+                    for _ in range(self.rearev_num_instructions):
+                        agg_per_ins.append(torch.zeros_like(h_stage))
+
+                fuse_in = torch.cat([h_stage] + agg_per_ins, dim=-1)
+                agg = self.rearev_fuse(fuse_in) + 0.1 * h0
+                h_stage = self.rearev_cell(agg, h_stage)
+                h_stage = self.step_norm(h_stage)
+                h_stage = self.dropout(h_stage)
+                p_stage = torch.softmax(self.rearev_node_score(h_stage).squeeze(-1), dim=0)
+
+            if stage_idx + 1 >= self.rearev_adapt_stages:
+                break
+
+            if seed_mask is not None and bool(seed_mask[:n].any()):
+                he = h_stage[seed_mask[:n].to(device=h_stage.device)].mean(dim=0)
+            else:
+                he = h_stage.mean(dim=0)
+            he_rep = he.unsqueeze(0).expand(self.rearev_num_instructions, -1)
+            ins = self.rearev_ins_update(he_rep, ins)
+            # ReaRev-like stage reset: restart propagation from seed distribution.
+            p_stage = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
+
+        return h_stage
+
+    def _run_inner(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        src: Optional[torch.Tensor],
+        dst: Optional[torch.Tensor],
+        rel_h: Optional[torch.Tensor],
+        ones: Optional[torch.Tensor],
+        q_inj: torch.Tensor,
+        seed_mask: Optional[torch.Tensor],
+        n: int,
+        e: int,
+    ) -> torch.Tensor:
+        return self._inner_recur_rearev(
+            h=h,
+            h0=h0,
+            src=src,
+            dst=dst,
+            rel_h=rel_h,
+            q_inj=q_inj,
+            seed_mask=seed_mask,
+            n=n,
+            e=e,
+        )
 
     def forward(
         self,
         node_emb: torch.Tensor,
         node_mask: torch.Tensor,
+        seed_mask: Optional[torch.Tensor],
         edge_src: torch.Tensor,
         edge_dst: torch.Tensor,
         edge_rel_emb: torch.Tensor,
@@ -450,6 +570,7 @@ class RecursiveSubgraphReader(nn.Module):
             h = h_all[i, :n]
             h0 = h.clone()
             qb = qh[i].unsqueeze(0)
+            seed_i = seed_mask[i, :n] if seed_mask is not None else None
 
             e = int(edge_mask[i].sum().item()) if edge_mask.shape[1] > 0 else 0
             if e > 0:
@@ -467,7 +588,7 @@ class RecursiveSubgraphReader(nn.Module):
                 ones = None
 
             if not self.outer_reasoning_enabled:
-                h = self._inner_recur(
+                h = self._run_inner(
                     h=h,
                     h0=h0,
                     src=src,
@@ -475,6 +596,7 @@ class RecursiveSubgraphReader(nn.Module):
                     rel_h=rel_h,
                     ones=ones,
                     q_inj=qb,
+                    seed_mask=seed_i,
                     n=n,
                     e=e,
                 )
@@ -492,7 +614,7 @@ class RecursiveSubgraphReader(nn.Module):
                     z = self.outer_state_update(ctx.unsqueeze(0), z.unsqueeze(0)).squeeze(0)
                     z = self.outer_state_norm(z)
                     q_loop = qb + z.unsqueeze(0)
-                    h = self._inner_recur(
+                    h = self._run_inner(
                         h=h,
                         h0=h0,
                         src=src,
@@ -500,6 +622,7 @@ class RecursiveSubgraphReader(nn.Module):
                         rel_h=rel_h,
                         ones=ones,
                         q_inj=q_loop,
+                        seed_mask=seed_i,
                         n=n,
                         e=e,
                     )
@@ -684,6 +807,7 @@ def evaluate_subgraph_reader(
         logits = model(
             node_emb=batch_dev["node_emb"],
             node_mask=batch_dev["node_mask"],
+            seed_mask=batch_dev.get("seed_mask", None),
             edge_src=batch_dev["edge_src"],
             edge_dst=batch_dev["edge_dst"],
             edge_rel_emb=batch_dev["edge_rel_emb"],
@@ -761,6 +885,9 @@ def _load_model_from_ckpt_or_init(
     use_direction_embedding: bool = False,
     outer_reasoning_enabled: bool = False,
     outer_reasoning_steps: int = 3,
+    gnn_variant: str = "rearev_bfs",
+    rearev_num_instructions: int = 3,
+    rearev_adapt_stages: int = 1,
 ) -> Tuple[RecursiveSubgraphReader, Optional[dict]]:
     meta = None
     if ckpt_path and os.path.exists(ckpt_path):
@@ -774,6 +901,12 @@ def _load_model_from_ckpt_or_init(
                 outer_reasoning_enabled = _as_bool(model_cfg.get("outer_reasoning_enabled", False))
             if isinstance(model_cfg, dict) and "outer_reasoning_steps" in model_cfg:
                 outer_reasoning_steps = int(model_cfg.get("outer_reasoning_steps", 3))
+            if isinstance(model_cfg, dict) and "gnn_variant" in model_cfg:
+                gnn_variant = str(model_cfg.get("gnn_variant", "rearev_bfs"))
+            if isinstance(model_cfg, dict) and "rearev_num_instructions" in model_cfg:
+                rearev_num_instructions = int(model_cfg.get("rearev_num_instructions", 3))
+            if isinstance(model_cfg, dict) and "rearev_adapt_stages" in model_cfg:
+                rearev_adapt_stages = int(model_cfg.get("rearev_adapt_stages", 1))
 
     model = RecursiveSubgraphReader(
         entity_dim=entity_dim,
@@ -785,6 +918,9 @@ def _load_model_from_ckpt_or_init(
         use_direction_embedding=bool(use_direction_embedding),
         outer_reasoning_enabled=bool(outer_reasoning_enabled),
         outer_reasoning_steps=max(1, int(outer_reasoning_steps)),
+        gnn_variant=str(gnn_variant),
+        rearev_num_instructions=max(1, int(rearev_num_instructions)),
+        rearev_adapt_stages=max(1, int(rearev_adapt_stages)),
     )
     if ckpt_path and os.path.exists(ckpt_path):
         obj = meta if meta is not None else torch.load(ckpt_path, map_location="cpu")
@@ -832,6 +968,9 @@ def train_subgraph_reader(
     )
     outer_reasoning_enabled = _as_bool(getattr(args, "subgraph_outer_reasoning_enabled", False))
     outer_reasoning_steps = max(1, int(getattr(args, "subgraph_outer_reasoning_steps", 3)))
+    gnn_variant = "rearev_bfs"
+    rearev_num_instructions = max(1, int(getattr(args, "subgraph_rearev_num_ins", 3)))
+    rearev_adapt_stages = max(1, int(getattr(args, "subgraph_rearev_adapt_stages", 1)))
     ranking_enabled = _as_bool(getattr(args, "subgraph_ranking_enabled", False))
     ranking_weight = max(0.0, float(getattr(args, "subgraph_ranking_weight", 0.0)))
     ranking_margin = float(getattr(args, "subgraph_ranking_margin", 0.2))
@@ -899,6 +1038,9 @@ def train_subgraph_reader(
         use_direction_embedding=direction_embedding_enabled,
         outer_reasoning_enabled=outer_reasoning_enabled,
         outer_reasoning_steps=outer_reasoning_steps,
+        gnn_variant=gnn_variant,
+        rearev_num_instructions=rearev_num_instructions,
+        rearev_adapt_stages=rearev_adapt_stages,
     )
     model.to(device)
     if is_ddp:
@@ -970,6 +1112,9 @@ def train_subgraph_reader(
             f"direction_embedding={direction_embedding_enabled} "
             f"outer_reasoning={outer_reasoning_enabled} "
             f"outer_steps={outer_reasoning_steps} "
+            f"gnn_variant={gnn_variant} "
+            f"rearev_num_ins={rearev_num_instructions} "
+            f"rearev_adapt_stages={rearev_adapt_stages} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
             f"bce_hardneg={bce_hard_negative_enabled} "
@@ -1003,6 +1148,7 @@ def train_subgraph_reader(
             logits = model(
                 node_emb=batch_dev["node_emb"],
                 node_mask=batch_dev["node_mask"],
+                seed_mask=batch_dev.get("seed_mask", None),
                 edge_src=batch_dev["edge_src"],
                 edge_dst=batch_dev["edge_dst"],
                 edge_rel_emb=batch_dev["edge_rel_emb"],
@@ -1160,6 +1306,9 @@ def train_subgraph_reader(
                     "use_direction_embedding": bool(direction_embedding_enabled),
                     "outer_reasoning_enabled": bool(outer_reasoning_enabled),
                     "outer_reasoning_steps": int(outer_reasoning_steps),
+                    "gnn_variant": str(gnn_variant),
+                    "rearev_num_instructions": int(rearev_num_instructions),
+                    "rearev_adapt_stages": int(rearev_adapt_stages),
                 },
                 "subgraph_cfg": {
                     "hops": int(hops),
@@ -1170,6 +1319,9 @@ def train_subgraph_reader(
                     "pred_threshold": float(threshold),
                     "outer_reasoning_enabled": bool(outer_reasoning_enabled),
                     "outer_reasoning_steps": int(outer_reasoning_steps),
+                    "gnn_variant": str(gnn_variant),
+                    "rearev_num_instructions": int(rearev_num_instructions),
+                    "rearev_adapt_stages": int(rearev_adapt_stages),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
@@ -1307,6 +1459,13 @@ def test_subgraph_reader(args):
     outer_reasoning_steps = max(
         1, int(getattr(args, "subgraph_outer_reasoning_steps", model_cfg.get("outer_reasoning_steps", 3)))
     )
+    gnn_variant = "rearev_bfs"
+    rearev_num_instructions = max(
+        1, int(getattr(args, "subgraph_rearev_num_ins", model_cfg.get("rearev_num_instructions", 3)))
+    )
+    rearev_adapt_stages = max(
+        1, int(getattr(args, "subgraph_rearev_adapt_stages", model_cfg.get("rearev_adapt_stages", 1)))
+    )
 
     model = RecursiveSubgraphReader(
         entity_dim=ent_dim,
@@ -1318,6 +1477,9 @@ def test_subgraph_reader(args):
         use_direction_embedding=direction_embedding_enabled,
         outer_reasoning_enabled=outer_reasoning_enabled,
         outer_reasoning_steps=outer_reasoning_steps,
+        gnn_variant=gnn_variant,
+        rearev_num_instructions=rearev_num_instructions,
+        rearev_adapt_stages=rearev_adapt_stages,
     )
     sd = ckpt_obj.get("model_state", ckpt_obj) if isinstance(ckpt_obj, dict) else ckpt_obj
     skipped, missing = _safe_load_state_dict(model, sd)
