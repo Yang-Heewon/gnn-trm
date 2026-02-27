@@ -1,42 +1,29 @@
-# GRAPH-TRAVERSE (Subgraph Reader Track)
+# KGQA ReaRev-Only Subgraph Reader
 
-This repository is organized around a **Subgraph Reader** KGQA pipeline with two reproducible training tracks:
+This repository currently runs **only the ReaRev-style subgraph reader path**.
 
-- `v2` baseline (stable BCE-oriented subgraph reader)
-- `outer_yz` track (TRM-style outer reasoning loop over `(y, z)`)
-
-The current setup supports:
-
-1. data download / preprocessing
-2. embedding generation
-3. distributed training (DDP)
-4. evaluation on dev/test
+- `baseline` subgraph recurrence is disabled in code.
+- `subgraph_gnn_variant` is fixed to `rearev_bfs` during train/test.
+- Recursion depth is user-controlled by `subgraph_recursion_steps`.
 
 ## 1) Repo Layout
 
-- `trm_agent/`: dataset jsonl and embeddings/ckpt locations used by runtime
-- `trm_unified/`: model and core training logic (`subgraph_reader.py`, `train_core.py`)
-- `trm_rag_style/`: run entrypoint, config, and training scripts
-- `trm_rag_style/scripts/README.md`: script-level quick guide
+- `trm_agent/`: processed jsonl, embeddings, checkpoints
+- `trm_unified/`: core logic (`subgraph_reader.py`, `train_core.py`)
+- `trm_rag_style/`: config and pipeline entrypoint
 
 ## 2) Environment
 
-Recommended Python env: `taiLab`
-
 ```bash
-cd /data2/workspace/heewon/GRAPH-TRAVERSE-newrepo
+cd /data2/workspace/heewon/KGQA
 pip install -r requirements.txt
 ```
 
 ## 3) Data and Embeddings
 
-### 3.1 Download / preprocess
-
 ```bash
 bash trm_rag_style/scripts/run_download.sh
 ```
-
-### 3.2 Build embeddings (entity/relation/query)
 
 ```bash
 DATASET=cwq \
@@ -47,105 +34,49 @@ EMBED_BATCH_SIZE=512 \
 bash trm_rag_style/scripts/run_embed.sh
 ```
 
-Embeddings are resolved under:
-
-- `trm_agent/emb/${DATASET}_${EMB_TAG}`
-
-## 4) Training Tracks
-
-## 4.1 v2 baseline (recommended strong baseline)
-
-Resume/scratch capable script:
-
-- `trm_rag_style/scripts/run_train_subgraph_v2_resume.sh`
-
-Example:
+## 4) Train (ReaRev Only)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
-MASTER_PORT=29606 \
-EPOCHS=50 \
-BATCH_SIZE=1 \
-HIDDEN_SIZE=768 \
-SUBGRAPH_RECURSION_STEPS=8 \
-SUBGRAPH_MAX_NODES=2048 \
-SUBGRAPH_MAX_EDGES=8192 \
-EMB_TAG=e5_w4_g4 \
-EMB_DIR=trm_agent/emb/cwq_e5_w4_g4 \
-CKPT_DIR=trm_agent/ckpt/cwq_trm_hier6_subgraph_3gpu_v2 \
-bash trm_rag_style/scripts/run_train_subgraph_v2_resume.sh
+python -m trm_agent.run \
+  --dataset cwq \
+  --model_impl trm_hier6 \
+  --stage train \
+  --override \
+    subgraph_reader_enabled=true \
+    emb_tag=e5_w4_g4 \
+    emb_dir=trm_agent/emb/cwq_e5_w4_g4 \
+    subgraph_recursion_steps=8 \
+    subgraph_rearev_num_ins=3 \
+    subgraph_rearev_adapt_stages=1
 ```
 
-## 4.2 outer_yz (TRM-style outer reasoning)
-
-Primary script:
-
-- `trm_rag_style/scripts/run_train_subgraph_outer_yz_resume.sh`
-
-What it supports:
-
-- `FROM_SCRATCH=true`: start from random init (`CKPT` ignored)
-- `FROM_SCRATCH=false`: resume/fine-tune from checkpoint
-- cosine LR schedule defaults for scratch
-- gradient accumulation via `SUBGRAPH_GRAD_ACCUM_STEPS`
-
-Example (scratch, cosine annealing, 4-GPU):
+## 5) Test
 
 ```bash
-PYTORCH_ALLOC_CONF=expandable_segments:True \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
-MASTER_PORT=29618 \
-FROM_SCRATCH=true \
-EPOCHS=50 \
-LR=5e-5 \
-SUBGRAPH_LR_SCHEDULER=cosine \
-SUBGRAPH_LR_MIN=1e-6 \
-HIDDEN_SIZE=768 \
-SUBGRAPH_RECURSION_STEPS=10 \
-SUBGRAPH_OUTER_REASONING_STEPS=2 \
-SUBGRAPH_GRAD_ACCUM_STEPS=4 \
-WANDB_MODE=online \
-WANDB_RUN_NAME=cwq_outer_yz_scratch_ca_lr5e5 \
-bash trm_rag_style/scripts/run_train_subgraph_outer_yz_resume.sh
-```
-
-## 5) Evaluation
-
-Single checkpoint test:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
-MASTER_PORT=29620 \
 python -m trm_agent.run \
   --dataset cwq \
   --model_impl trm_hier6 \
   --stage test \
-  --ckpt trm_agent/ckpt/<your_dir>/model_epXX.pt \
+  --ckpt trm_agent/ckpt/<your_run_dir>/model_epXX.pt \
   --override \
+    subgraph_reader_enabled=true \
     emb_tag=e5_w4_g4 \
     emb_dir=trm_agent/emb/cwq_e5_w4_g4 \
     eval_json=trm_agent/processed/cwq/test.jsonl \
     query_emb_eval_npy=trm_agent/emb/cwq_e5_w4_g4/query_test.npy \
-    batch_size=8 \
-    subgraph_reader_enabled=true
+    batch_size=8
 ```
 
-## 6) Notes on Current Training Logic
+## 6) Main Knobs
 
-- Node-level binary objective: BCE-with-logits
-- Optional hard-negative BCE filtering (`subgraph_bce_hard_negative_enabled`)
-- Optional ranking hard-negative loss (`subgraph_ranking_enabled`)
-- Outer reasoning loop (`subgraph_outer_reasoning_enabled`) adds global latent updates
-- Gradient accumulation in subgraph training (`subgraph_grad_accum_steps`)
+- `subgraph_recursion_steps`: inner recurrent steps per stage
+- `subgraph_rearev_num_ins`: number of instructions
+- `subgraph_rearev_adapt_stages`: adaptive stage count
+- `subgraph_outer_reasoning_enabled`: optional outer loop on top of inner ReaRev recurrence
+- `subgraph_max_nodes`, `subgraph_max_edges`: subgraph budget and runtime/memory tradeoff
 
-## 7) W&B
+## 7) Notes
 
-If login is already configured (`~/.netrc`), use:
-
-- `WANDB_MODE=online`
-- `WANDB_PROJECT=graph-traverse`
-- `WANDB_RUN_NAME=<your_run_name>`
-
+- Current training objective is node-level BCE-with-logits (with optional hard-negative/ranking losses).
+- ReaRev logic is implemented in `trm_unified/subgraph_reader.py`.
+- This is a ReaRev-style integration in this codebase, not a strict 1:1 reproduction of the original repository.
