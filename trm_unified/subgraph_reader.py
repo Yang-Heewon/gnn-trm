@@ -409,6 +409,11 @@ class RecursiveSubgraphReader(nn.Module):
         rearev_normalized_gnn: bool = False,
         rearev_latent_reasoning_enabled: bool = False,
         rearev_latent_residual_alpha: float = 0.25,
+        rearev_global_gate_enabled: bool = False,
+        rearev_logit_global_fusion_enabled: bool = False,
+        rearev_dynamic_halting_enabled: bool = False,
+        rearev_dynamic_halting_threshold: float = 0.9,
+        rearev_dynamic_halting_min_steps: int = 1,
     ):
         super().__init__()
         self.entity_dim = int(entity_dim)
@@ -430,6 +435,13 @@ class RecursiveSubgraphReader(nn.Module):
         self.rearev_normalized_gnn = bool(rearev_normalized_gnn)
         self.rearev_latent_reasoning_enabled = bool(rearev_latent_reasoning_enabled)
         self.rearev_latent_residual_alpha = float(max(0.0, rearev_latent_residual_alpha))
+        self.rearev_global_gate_enabled = bool(rearev_global_gate_enabled)
+        self.rearev_logit_global_fusion_enabled = bool(rearev_logit_global_fusion_enabled)
+        self.rearev_dynamic_halting_enabled = bool(rearev_dynamic_halting_enabled)
+        self.rearev_dynamic_halting_threshold = float(
+            min(1.0, max(0.0, rearev_dynamic_halting_threshold))
+        )
+        self.rearev_dynamic_halting_min_steps = max(1, int(rearev_dynamic_halting_min_steps))
 
         self.node_proj = nn.Linear(self.entity_dim, self.hidden_size)
         self.rel_proj = nn.Linear(self.relation_dim, self.hidden_size)
@@ -459,6 +471,18 @@ class RecursiveSubgraphReader(nn.Module):
             if self.rearev_adapt_stages > 1
             else None
         )
+        if self.rearev_global_gate_enabled:
+            self.rearev_global_gate = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        else:
+            self.rearev_global_gate = None
+        if self.rearev_logit_global_fusion_enabled:
+            self.rearev_score_fusion = nn.Sequential(
+                nn.Linear(self.hidden_size * 3, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, 1),
+            )
+        else:
+            self.rearev_score_fusion = None
         if self.rearev_latent_reasoning_enabled:
             self.rearev_latent_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.rearev_latent_norm = nn.LayerNorm(self.hidden_size)
@@ -473,11 +497,24 @@ class RecursiveSubgraphReader(nn.Module):
             self.rearev_latent_gru = None
             self.rearev_latent_norm = None
             self.rearev_latent_to_ins = None
+        if self.rearev_dynamic_halting_enabled:
+            self.rearev_halt_proj = nn.Linear(self.hidden_size, 1)
+        else:
+            self.rearev_halt_proj = None
         if self.outer_reasoning_enabled:
             self.outer_state_update = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
         if self.use_direction_embedding:
             self.edge_dir_emb = nn.Embedding(2, self.hidden_size)
+
+    def _score_nodes(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        base_score = self.out_head(self.dropout(h)).squeeze(-1)
+        if self.rearev_logit_global_fusion_enabled and self.rearev_score_fusion is not None:
+            z_expand = z.unsqueeze(0).expand(h.shape[0], -1)
+            fuse_in = torch.cat([h, z_expand, h * z_expand], dim=-1)
+            fusion_delta = self.rearev_score_fusion(self.dropout(fuse_in)).squeeze(-1)
+            return base_score + fusion_delta
+        return base_score
 
     def _seed_distribution(
         self,
@@ -569,9 +606,11 @@ class RecursiveSubgraphReader(nn.Module):
         latent_state = q_state
 
         h_stage = h
-        score_tp = self.out_head(self.dropout(h_stage)).squeeze(-1)
+        score_tp = self._score_nodes(h_stage, latent_state)
         for stage_idx in range(self.rearev_adapt_stages):
             curr_dist = seed_dist
+            halt_mass = 0.0
+            alive_prob = h_stage.new_tensor(1.0)
             for step_idx in range(self.recursion_steps):
                 rel_linear = self.rearev_rel_linears[step_idx]
                 e2e_linear = self.rearev_e2e_linears[step_idx]
@@ -600,21 +639,59 @@ class RecursiveSubgraphReader(nn.Module):
                     )
                     neighbor_reps.append(agg_fwd)
                     neighbor_reps.append(agg_inv)
+                prev_h = h_stage
+                prev_score = score_tp
+                prev_dist = curr_dist
+                prev_latent = latent_state
                 next_local_entity_emb = torch.cat([h_stage] + neighbor_reps, dim=-1)
-                h_stage = F.relu(e2e_linear(self.dropout(next_local_entity_emb)))
-                score_tp = self.out_head(self.dropout(h_stage)).squeeze(-1)
-                curr_dist = torch.softmax(score_tp, dim=0)
+                h_msg = F.relu(e2e_linear(self.dropout(next_local_entity_emb)))
+                if self.rearev_global_gate_enabled and self.rearev_global_gate is not None:
+                    z_expand = prev_latent.unsqueeze(0).expand(prev_h.shape[0], -1)
+                    gate_in = torch.cat([prev_h, z_expand], dim=-1)
+                    gate = torch.sigmoid(self.rearev_global_gate(gate_in))
+                    h_candidate = gate * h_msg + (1.0 - gate) * prev_h
+                else:
+                    h_candidate = h_msg
+                score_candidate = self._score_nodes(h_candidate, prev_latent)
+                dist_candidate = torch.softmax(score_candidate, dim=0)
+                latent_candidate = prev_latent
                 if (
                     self.rearev_latent_reasoning_enabled
                     and self.rearev_latent_gru is not None
                     and self.rearev_latent_norm is not None
                 ):
-                    ctx = (h_stage * curr_dist.unsqueeze(-1)).sum(dim=0)
-                    latent_state = self.rearev_latent_gru(
+                    ctx = (h_candidate * dist_candidate.unsqueeze(-1)).sum(dim=0)
+                    latent_candidate = self.rearev_latent_gru(
                         ctx.unsqueeze(0),
-                        latent_state.unsqueeze(0),
+                        prev_latent.unsqueeze(0),
                     ).squeeze(0)
-                    latent_state = self.rearev_latent_norm(latent_state)
+                    latent_candidate = self.rearev_latent_norm(latent_candidate)
+                if self.rearev_dynamic_halting_enabled:
+                    alive_before = alive_prob
+                    p_halt = h_stage.new_tensor(0.0)
+                    if self.rearev_halt_proj is not None:
+                        p_halt = torch.sigmoid(self.rearev_halt_proj(latent_candidate)).squeeze(-1)
+                        if (step_idx + 1) < self.rearev_dynamic_halting_min_steps:
+                            p_halt = torch.zeros_like(p_halt)
+                    p_halt = p_halt.clamp(min=0.0, max=1.0)
+                    alive_prob = alive_before * (1.0 - p_halt)
+                    inv_alive = 1.0 - alive_prob
+                    h_stage = alive_prob * h_candidate + inv_alive * prev_h
+                    score_tp = alive_prob * score_candidate + inv_alive * prev_score
+                    curr_dist = alive_prob * dist_candidate + inv_alive * prev_dist
+                    latent_state = alive_prob * latent_candidate + inv_alive * prev_latent
+                    if not self.training:
+                        halt_mass += float((alive_before * p_halt).item())
+                        if (
+                            (step_idx + 1) >= self.rearev_dynamic_halting_min_steps
+                            and halt_mass >= self.rearev_dynamic_halting_threshold
+                        ):
+                            break
+                else:
+                    h_stage = h_candidate
+                    score_tp = score_candidate
+                    curr_dist = dist_candidate
+                    latent_state = latent_candidate
 
             if stage_idx + 1 >= self.rearev_adapt_stages:
                 break
@@ -705,7 +782,7 @@ class RecursiveSubgraphReader(nn.Module):
                 )
             else:
                 z = qb.squeeze(0)
-                y_logits = self.out_head(self.dropout(h)).squeeze(-1)
+                y_logits = self._score_nodes(h, z)
                 for _ in range(self.outer_reasoning_steps):
                     y_prob = torch.softmax(y_logits, dim=0)
                     denom = y_prob.sum().clamp(min=1e-6)
@@ -1020,6 +1097,11 @@ def _load_model_from_ckpt_or_init(
     rearev_normalized_gnn: bool = False,
     rearev_latent_reasoning_enabled: bool = False,
     rearev_latent_residual_alpha: float = 0.25,
+    rearev_global_gate_enabled: bool = False,
+    rearev_logit_global_fusion_enabled: bool = False,
+    rearev_dynamic_halting_enabled: bool = False,
+    rearev_dynamic_halting_threshold: float = 0.9,
+    rearev_dynamic_halting_min_steps: int = 1,
 ) -> Tuple[RecursiveSubgraphReader, Optional[dict]]:
     meta = None
     if ckpt_path and os.path.exists(ckpt_path):
@@ -1049,6 +1131,24 @@ def _load_model_from_ckpt_or_init(
                 )
             if isinstance(model_cfg, dict) and "rearev_latent_residual_alpha" in model_cfg:
                 rearev_latent_residual_alpha = float(model_cfg.get("rearev_latent_residual_alpha", 0.25))
+            if isinstance(model_cfg, dict) and "rearev_global_gate_enabled" in model_cfg:
+                rearev_global_gate_enabled = _as_bool(model_cfg.get("rearev_global_gate_enabled", False))
+            if isinstance(model_cfg, dict) and "rearev_logit_global_fusion_enabled" in model_cfg:
+                rearev_logit_global_fusion_enabled = _as_bool(
+                    model_cfg.get("rearev_logit_global_fusion_enabled", False)
+                )
+            if isinstance(model_cfg, dict) and "rearev_dynamic_halting_enabled" in model_cfg:
+                rearev_dynamic_halting_enabled = _as_bool(
+                    model_cfg.get("rearev_dynamic_halting_enabled", False)
+                )
+            if isinstance(model_cfg, dict) and "rearev_dynamic_halting_threshold" in model_cfg:
+                rearev_dynamic_halting_threshold = float(
+                    model_cfg.get("rearev_dynamic_halting_threshold", 0.9)
+                )
+            if isinstance(model_cfg, dict) and "rearev_dynamic_halting_min_steps" in model_cfg:
+                rearev_dynamic_halting_min_steps = int(
+                    model_cfg.get("rearev_dynamic_halting_min_steps", 1)
+                )
 
     model = RecursiveSubgraphReader(
         entity_dim=entity_dim,
@@ -1066,6 +1166,11 @@ def _load_model_from_ckpt_or_init(
         rearev_normalized_gnn=bool(rearev_normalized_gnn),
         rearev_latent_reasoning_enabled=bool(rearev_latent_reasoning_enabled),
         rearev_latent_residual_alpha=float(max(0.0, rearev_latent_residual_alpha)),
+        rearev_global_gate_enabled=bool(rearev_global_gate_enabled),
+        rearev_logit_global_fusion_enabled=bool(rearev_logit_global_fusion_enabled),
+        rearev_dynamic_halting_enabled=bool(rearev_dynamic_halting_enabled),
+        rearev_dynamic_halting_threshold=float(rearev_dynamic_halting_threshold),
+        rearev_dynamic_halting_min_steps=max(1, int(rearev_dynamic_halting_min_steps)),
     )
     if ckpt_path and os.path.exists(ckpt_path):
         obj = meta if meta is not None else torch.load(ckpt_path, map_location="cpu")
@@ -1123,6 +1228,21 @@ def train_subgraph_reader(
     )
     rearev_latent_residual_alpha = max(
         0.0, float(getattr(args, "subgraph_rearev_latent_residual_alpha", 0.25))
+    )
+    rearev_global_gate_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_global_gate_enabled", False)
+    )
+    rearev_logit_global_fusion_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_logit_global_fusion_enabled", False)
+    )
+    rearev_dynamic_halting_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_dynamic_halting_enabled", False)
+    )
+    rearev_dynamic_halting_threshold = float(
+        getattr(args, "subgraph_rearev_dynamic_halting_threshold", 0.9)
+    )
+    rearev_dynamic_halting_min_steps = max(
+        1, int(getattr(args, "subgraph_rearev_dynamic_halting_min_steps", 1))
     )
     ranking_enabled = _as_bool(getattr(args, "subgraph_ranking_enabled", False))
     ranking_weight = max(0.0, float(getattr(args, "subgraph_ranking_weight", 0.0)))
@@ -1205,6 +1325,11 @@ def train_subgraph_reader(
         rearev_normalized_gnn=rearev_normalized_gnn,
         rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
         rearev_latent_residual_alpha=rearev_latent_residual_alpha,
+        rearev_global_gate_enabled=rearev_global_gate_enabled,
+        rearev_logit_global_fusion_enabled=rearev_logit_global_fusion_enabled,
+        rearev_dynamic_halting_enabled=rearev_dynamic_halting_enabled,
+        rearev_dynamic_halting_threshold=rearev_dynamic_halting_threshold,
+        rearev_dynamic_halting_min_steps=rearev_dynamic_halting_min_steps,
     )
     model.to(device)
     if is_ddp:
@@ -1283,6 +1408,11 @@ def train_subgraph_reader(
             f"rearev_normalized_gnn={rearev_normalized_gnn} "
             f"rearev_latent={rearev_latent_reasoning_enabled} "
             f"rearev_latent_alpha={rearev_latent_residual_alpha:.3f} "
+            f"rearev_gate={rearev_global_gate_enabled} "
+            f"rearev_logit_fusion={rearev_logit_global_fusion_enabled} "
+            f"rearev_dyn_halt={rearev_dynamic_halting_enabled} "
+            f"rearev_halt_thr={rearev_dynamic_halting_threshold:.3f} "
+            f"rearev_halt_min={rearev_dynamic_halting_min_steps} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
             f"bce_hardneg={bce_hard_negative_enabled} "
@@ -1494,6 +1624,11 @@ def train_subgraph_reader(
                     "rearev_normalized_gnn": bool(rearev_normalized_gnn),
                     "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
                     "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
+                    "rearev_global_gate_enabled": bool(rearev_global_gate_enabled),
+                    "rearev_logit_global_fusion_enabled": bool(rearev_logit_global_fusion_enabled),
+                    "rearev_dynamic_halting_enabled": bool(rearev_dynamic_halting_enabled),
+                    "rearev_dynamic_halting_threshold": float(rearev_dynamic_halting_threshold),
+                    "rearev_dynamic_halting_min_steps": int(rearev_dynamic_halting_min_steps),
                 },
                 "subgraph_cfg": {
                     "hops": int(hops),
@@ -1511,6 +1646,11 @@ def train_subgraph_reader(
                     "rearev_normalized_gnn": bool(rearev_normalized_gnn),
                     "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
                     "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
+                    "rearev_global_gate_enabled": bool(rearev_global_gate_enabled),
+                    "rearev_logit_global_fusion_enabled": bool(rearev_logit_global_fusion_enabled),
+                    "rearev_dynamic_halting_enabled": bool(rearev_dynamic_halting_enabled),
+                    "rearev_dynamic_halting_threshold": float(rearev_dynamic_halting_threshold),
+                    "rearev_dynamic_halting_min_steps": int(rearev_dynamic_halting_min_steps),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
@@ -1690,6 +1830,44 @@ def test_subgraph_reader(args):
             )
         ),
     )
+    rearev_global_gate_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_global_gate_enabled",
+            model_cfg.get("rearev_global_gate_enabled", False),
+        )
+    )
+    rearev_logit_global_fusion_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_logit_global_fusion_enabled",
+            model_cfg.get("rearev_logit_global_fusion_enabled", False),
+        )
+    )
+    rearev_dynamic_halting_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_dynamic_halting_enabled",
+            model_cfg.get("rearev_dynamic_halting_enabled", False),
+        )
+    )
+    rearev_dynamic_halting_threshold = float(
+        getattr(
+            args,
+            "subgraph_rearev_dynamic_halting_threshold",
+            model_cfg.get("rearev_dynamic_halting_threshold", 0.9),
+        )
+    )
+    rearev_dynamic_halting_min_steps = max(
+        1,
+        int(
+            getattr(
+                args,
+                "subgraph_rearev_dynamic_halting_min_steps",
+                model_cfg.get("rearev_dynamic_halting_min_steps", 1),
+            )
+        ),
+    )
 
     model = RecursiveSubgraphReader(
         entity_dim=ent_dim,
@@ -1707,6 +1885,11 @@ def test_subgraph_reader(args):
         rearev_normalized_gnn=rearev_normalized_gnn,
         rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
         rearev_latent_residual_alpha=rearev_latent_residual_alpha,
+        rearev_global_gate_enabled=rearev_global_gate_enabled,
+        rearev_logit_global_fusion_enabled=rearev_logit_global_fusion_enabled,
+        rearev_dynamic_halting_enabled=rearev_dynamic_halting_enabled,
+        rearev_dynamic_halting_threshold=rearev_dynamic_halting_threshold,
+        rearev_dynamic_halting_min_steps=rearev_dynamic_halting_min_steps,
     )
     sd = ckpt_obj.get("model_state", ckpt_obj) if isinstance(ckpt_obj, dict) else ckpt_obj
     skipped, missing = _safe_load_state_dict(model, sd)
