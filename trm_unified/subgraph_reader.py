@@ -368,6 +368,29 @@ class SubgraphCollator:
         }
 
 
+class _ReaRevFusion(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.r = nn.Linear(hidden_size * 3, hidden_size, bias=False)
+        self.g = nn.Linear(hidden_size * 3, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        xy = torch.cat([x, y, x - y], dim=-1)
+        r_val = self.r(xy)
+        g_val = torch.sigmoid(self.g(xy))
+        return g_val * r_val + (1.0 - g_val) * x
+
+
+class _ReaRevQueryReform(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.fusion = _ReaRevFusion(hidden_size)
+
+    def forward(self, q_node: torch.Tensor, ent_emb: torch.Tensor, seed_dist: torch.Tensor) -> torch.Tensor:
+        seed_retrieve = torch.matmul(seed_dist.unsqueeze(0), ent_emb).squeeze(0)
+        return self.fusion(q_node, seed_retrieve)
+
+
 class RecursiveSubgraphReader(nn.Module):
     def __init__(
         self,
@@ -383,6 +406,9 @@ class RecursiveSubgraphReader(nn.Module):
         gnn_variant: str = "rearev_bfs",
         rearev_num_instructions: int = 3,
         rearev_adapt_stages: int = 1,
+        rearev_normalized_gnn: bool = False,
+        rearev_latent_reasoning_enabled: bool = False,
+        rearev_latent_residual_alpha: float = 0.25,
     ):
         super().__init__()
         self.entity_dim = int(entity_dim)
@@ -401,44 +427,57 @@ class RecursiveSubgraphReader(nn.Module):
         self.gnn_variant = variant
         self.rearev_num_instructions = max(1, int(rearev_num_instructions))
         self.rearev_adapt_stages = max(1, int(rearev_adapt_stages))
+        self.rearev_normalized_gnn = bool(rearev_normalized_gnn)
+        self.rearev_latent_reasoning_enabled = bool(rearev_latent_reasoning_enabled)
+        self.rearev_latent_residual_alpha = float(max(0.0, rearev_latent_residual_alpha))
 
         self.node_proj = nn.Linear(self.entity_dim, self.hidden_size)
         self.rel_proj = nn.Linear(self.relation_dim, self.hidden_size)
+        self.rel_proj_inv = nn.Linear(self.relation_dim, self.hidden_size)
         self.q_proj = nn.Linear(self.query_dim, self.hidden_size)
-        # Baseline branch is intentionally disabled in this build.
-        self.msg_mlp = None
-        self.cell = None
-        self.step_norm = nn.LayerNorm(self.hidden_size)
         self.dropout = nn.Dropout(float(dropout))
+        # Shared score function (ReaRev score_func).
         self.out_head = nn.Linear(self.hidden_size, 1)
         self.rearev_ins_proj = nn.Linear(self.hidden_size, self.hidden_size * self.rearev_num_instructions)
-        self.rearev_fuse = nn.Sequential(
-            nn.Linear(self.hidden_size * (1 + self.rearev_num_instructions), self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
+        self.rearev_rel_linears = nn.ModuleList(
+            [nn.Linear(self.hidden_size, self.hidden_size) for _ in range(self.recursion_steps)]
         )
-        self.rearev_cell = nn.GRUCell(self.hidden_size, self.hidden_size)
-        self.rearev_node_score = nn.Linear(self.hidden_size, 1)
-        self.rearev_ins_update = nn.GRUCell(self.hidden_size, self.hidden_size)
+        self.rearev_e2e_linears = nn.ModuleList(
+            [
+                nn.Linear(
+                    self.hidden_size * (1 + 2 * self.rearev_num_instructions),
+                    self.hidden_size,
+                )
+                for _ in range(self.recursion_steps)
+            ]
+        )
+        # ReaRev reform blocks are only needed when we actually perform stage-to-stage
+        # instruction updates (adapt_stages > 1). Keeping them absent for single-stage
+        # runs avoids DDP unused-parameter failures with find_unused_parameters=False.
+        self.rearev_reforms = (
+            nn.ModuleList([_ReaRevQueryReform(self.hidden_size) for _ in range(self.rearev_num_instructions)])
+            if self.rearev_adapt_stages > 1
+            else None
+        )
+        if self.rearev_latent_reasoning_enabled:
+            self.rearev_latent_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
+            self.rearev_latent_norm = nn.LayerNorm(self.hidden_size)
+            self.rearev_latent_to_ins = nn.Linear(
+                self.hidden_size,
+                self.hidden_size * self.rearev_num_instructions,
+            )
+            # Zero-init keeps step-0 behavior equivalent to vanilla ReaRev, then learns deltas.
+            nn.init.zeros_(self.rearev_latent_to_ins.weight)
+            nn.init.zeros_(self.rearev_latent_to_ins.bias)
+        else:
+            self.rearev_latent_gru = None
+            self.rearev_latent_norm = None
+            self.rearev_latent_to_ins = None
         if self.outer_reasoning_enabled:
             self.outer_state_update = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
         if self.use_direction_embedding:
             self.edge_dir_emb = nn.Embedding(2, self.hidden_size)
-
-    def _inner_recur(
-        self,
-        h: torch.Tensor,
-        h0: torch.Tensor,
-        src: Optional[torch.Tensor],
-        dst: Optional[torch.Tensor],
-        rel_h: Optional[torch.Tensor],
-        ones: Optional[torch.Tensor],
-        q_inj: torch.Tensor,
-        n: int,
-        e: int,
-    ) -> torch.Tensor:
-        raise RuntimeError("baseline recurrence is disabled; use gnn_variant='rearev_bfs'.")
 
     def _seed_distribution(
         self,
@@ -460,86 +499,151 @@ class RecursiveSubgraphReader(nn.Module):
             return p
         return p / denom
 
+    def _edge_weights(
+        self,
+        src: Optional[torch.Tensor],
+        n: int,
+        e: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if e <= 0 or src is None:
+            return None
+        if not self.rearev_normalized_gnn:
+            return torch.ones((e,), dtype=dtype, device=device)
+        deg = torch.zeros((n,), dtype=dtype, device=device)
+        deg.index_add_(0, src, torch.ones((e,), dtype=dtype, device=device))
+        return 1.0 / deg[src].clamp(min=1.0)
+
+    def _reason_layer_pair(
+        self,
+        curr_dist: torch.Tensor,
+        instruction: torch.Tensor,
+        rel_linear: nn.Linear,
+        rel_h: Optional[torch.Tensor],
+        rel_h_inv: Optional[torch.Tensor],
+        src: Optional[torch.Tensor],
+        dst: Optional[torch.Tensor],
+        edge_w: Optional[torch.Tensor],
+        n: int,
+        e: int,
+        ref_h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if e <= 0 or src is None or dst is None or rel_h is None or rel_h_inv is None:
+            z = torch.zeros_like(ref_h)
+            return z, z
+        fact_query = instruction.unsqueeze(0).expand(e, -1)
+
+        fact_val_fwd = F.relu(rel_linear(rel_h) * fact_query)
+        fact_val_inv = F.relu(rel_linear(rel_h_inv) * fact_query)
+        if edge_w is not None:
+            ww = edge_w.unsqueeze(-1)
+            fact_val_fwd = fact_val_fwd * ww
+            fact_val_inv = fact_val_inv * ww
+
+        msg_fwd = fact_val_fwd * curr_dist[src].unsqueeze(-1)
+        msg_inv = fact_val_inv * curr_dist[dst].unsqueeze(-1)
+
+        agg_fwd = torch.zeros((n, self.hidden_size), dtype=ref_h.dtype, device=ref_h.device)
+        agg_inv = torch.zeros((n, self.hidden_size), dtype=ref_h.dtype, device=ref_h.device)
+        agg_fwd.index_add_(0, dst, msg_fwd)
+        agg_inv.index_add_(0, src, msg_inv)
+        return agg_fwd, agg_inv
+
     def _inner_recur_rearev(
         self,
         h: torch.Tensor,
-        h0: torch.Tensor,
         src: Optional[torch.Tensor],
         dst: Optional[torch.Tensor],
         rel_h: Optional[torch.Tensor],
+        rel_h_inv: Optional[torch.Tensor],
         q_inj: torch.Tensor,
         seed_mask: Optional[torch.Tensor],
         n: int,
         e: int,
-    ) -> torch.Tensor:
-        if (
-            self.rearev_ins_proj is None
-            or self.rearev_fuse is None
-            or self.rearev_cell is None
-            or self.rearev_node_score is None
-            or self.rearev_ins_update is None
-        ):
-            raise RuntimeError("rearev modules are not initialized for this gnn_variant.")
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         q_state = q_inj.squeeze(0)
-        ins = self.rearev_ins_proj(q_state).view(self.rearev_num_instructions, self.hidden_size)
+        instructions = self.rearev_ins_proj(q_state).view(self.rearev_num_instructions, self.hidden_size)
+        seed_dist = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
+        edge_w = self._edge_weights(src=src, n=n, e=e, dtype=h.dtype, device=h.device)
+        latent_state = q_state
+
         h_stage = h
-        p_stage = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
-
+        score_tp = self.out_head(self.dropout(h_stage)).squeeze(-1)
         for stage_idx in range(self.rearev_adapt_stages):
-            for _ in range(self.recursion_steps):
-                agg_per_ins: List[torch.Tensor] = []
-                if e > 0 and src is not None and dst is not None and rel_h is not None:
-                    src_prob = p_stage[src].unsqueeze(-1)
-                    for k in range(self.rearev_num_instructions):
-                        rel_cond = F.relu(rel_h * ins[k].unsqueeze(0))
-                        weighted = src_prob * rel_cond
-                        agg_k = torch.zeros_like(h_stage)
-                        agg_k.index_add_(0, dst, weighted)
-                        agg_per_ins.append(agg_k)
-                else:
-                    for _ in range(self.rearev_num_instructions):
-                        agg_per_ins.append(torch.zeros_like(h_stage))
-
-                fuse_in = torch.cat([h_stage] + agg_per_ins, dim=-1)
-                agg = self.rearev_fuse(fuse_in) + 0.1 * h0
-                h_stage = self.rearev_cell(agg, h_stage)
-                h_stage = self.step_norm(h_stage)
-                h_stage = self.dropout(h_stage)
-                p_stage = torch.softmax(self.rearev_node_score(h_stage).squeeze(-1), dim=0)
+            curr_dist = seed_dist
+            for step_idx in range(self.recursion_steps):
+                rel_linear = self.rearev_rel_linears[step_idx]
+                e2e_linear = self.rearev_e2e_linears[step_idx]
+                step_instructions = instructions
+                if self.rearev_latent_reasoning_enabled and self.rearev_latent_to_ins is not None:
+                    ins_delta = self.rearev_latent_to_ins(latent_state).view(
+                        self.rearev_num_instructions, self.hidden_size
+                    )
+                    step_instructions = instructions + (
+                        self.rearev_latent_residual_alpha * torch.tanh(ins_delta)
+                    )
+                neighbor_reps: List[torch.Tensor] = []
+                for ins_idx in range(self.rearev_num_instructions):
+                    agg_fwd, agg_inv = self._reason_layer_pair(
+                        curr_dist=curr_dist,
+                        instruction=step_instructions[ins_idx],
+                        rel_linear=rel_linear,
+                        rel_h=rel_h,
+                        rel_h_inv=rel_h_inv,
+                        src=src,
+                        dst=dst,
+                        edge_w=edge_w,
+                        n=n,
+                        e=e,
+                        ref_h=h_stage,
+                    )
+                    neighbor_reps.append(agg_fwd)
+                    neighbor_reps.append(agg_inv)
+                next_local_entity_emb = torch.cat([h_stage] + neighbor_reps, dim=-1)
+                h_stage = F.relu(e2e_linear(self.dropout(next_local_entity_emb)))
+                score_tp = self.out_head(self.dropout(h_stage)).squeeze(-1)
+                curr_dist = torch.softmax(score_tp, dim=0)
+                if (
+                    self.rearev_latent_reasoning_enabled
+                    and self.rearev_latent_gru is not None
+                    and self.rearev_latent_norm is not None
+                ):
+                    ctx = (h_stage * curr_dist.unsqueeze(-1)).sum(dim=0)
+                    latent_state = self.rearev_latent_gru(
+                        ctx.unsqueeze(0),
+                        latent_state.unsqueeze(0),
+                    ).squeeze(0)
+                    latent_state = self.rearev_latent_norm(latent_state)
 
             if stage_idx + 1 >= self.rearev_adapt_stages:
                 break
+            if self.rearev_reforms is not None:
+                updated: List[torch.Tensor] = []
+                for ins_idx, reform in enumerate(self.rearev_reforms):
+                    updated.append(reform(instructions[ins_idx], h_stage, seed_dist))
+                instructions = torch.stack(updated, dim=0)
 
-            if seed_mask is not None and bool(seed_mask[:n].any()):
-                he = h_stage[seed_mask[:n].to(device=h_stage.device)].mean(dim=0)
-            else:
-                he = h_stage.mean(dim=0)
-            he_rep = he.unsqueeze(0).expand(self.rearev_num_instructions, -1)
-            ins = self.rearev_ins_update(he_rep, ins)
-            # ReaRev-like stage reset: restart propagation from seed distribution.
-            p_stage = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
-
-        return h_stage
+        return h_stage, score_tp
 
     def _run_inner(
         self,
         h: torch.Tensor,
-        h0: torch.Tensor,
         src: Optional[torch.Tensor],
         dst: Optional[torch.Tensor],
         rel_h: Optional[torch.Tensor],
-        ones: Optional[torch.Tensor],
+        rel_h_inv: Optional[torch.Tensor],
         q_inj: torch.Tensor,
         seed_mask: Optional[torch.Tensor],
         n: int,
         e: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._inner_recur_rearev(
             h=h,
-            h0=h0,
             src=src,
             dst=dst,
             rel_h=rel_h,
+            rel_h_inv=rel_h_inv,
             q_inj=q_inj,
             seed_mask=seed_mask,
             n=n,
@@ -560,7 +664,7 @@ class RecursiveSubgraphReader(nn.Module):
     ) -> torch.Tensor:
         bsz, max_n, _ = node_emb.shape
         qh = self.q_proj(q_emb)
-        h_all = self.node_proj(node_emb) + qh.unsqueeze(1)
+        h_all = self.node_proj(node_emb)
         logits = node_emb.new_full((bsz, max_n), -1e4)
 
         for i in range(bsz):
@@ -568,7 +672,6 @@ class RecursiveSubgraphReader(nn.Module):
             if n <= 0:
                 continue
             h = h_all[i, :n]
-            h0 = h.clone()
             qb = qh[i].unsqueeze(0)
             seed_i = seed_mask[i, :n] if seed_mask is not None else None
 
@@ -577,56 +680,50 @@ class RecursiveSubgraphReader(nn.Module):
                 src = edge_src[i, :e].long()
                 dst = edge_dst[i, :e].long()
                 rel_h = self.rel_proj(edge_rel_emb[i, :e])
+                rel_h_inv = self.rel_proj_inv(edge_rel_emb[i, :e])
                 if self.use_direction_embedding and edge_dir is not None:
                     dir_ids = edge_dir[i, :e].long().clamp(min=0, max=1)
                     rel_h = rel_h + self.edge_dir_emb(dir_ids)
-                ones = torch.ones((e,), dtype=h.dtype, device=h.device)
+                    rel_h_inv = rel_h_inv + self.edge_dir_emb(1 - dir_ids)
             else:
                 src = None
                 dst = None
                 rel_h = None
-                ones = None
+                rel_h_inv = None
 
             if not self.outer_reasoning_enabled:
-                h = self._run_inner(
+                h, y_logits = self._run_inner(
                     h=h,
-                    h0=h0,
                     src=src,
                     dst=dst,
                     rel_h=rel_h,
-                    ones=ones,
+                    rel_h_inv=rel_h_inv,
                     q_inj=qb,
                     seed_mask=seed_i,
                     n=n,
                     e=e,
                 )
-                y_logits = self.out_head(h).squeeze(-1)
             else:
-                # Global latent recursion over (y_k, z_k):
-                # y_k: temporary node-answer distribution (from node logits)
-                # z_k: global reasoning state updated from y_k-weighted graph context
                 z = qb.squeeze(0)
-                y_logits = self.out_head(h).squeeze(-1)
+                y_logits = self.out_head(self.dropout(h)).squeeze(-1)
                 for _ in range(self.outer_reasoning_steps):
-                    y_prob = torch.sigmoid(y_logits)
+                    y_prob = torch.softmax(y_logits, dim=0)
                     denom = y_prob.sum().clamp(min=1e-6)
                     ctx = (h * y_prob.unsqueeze(-1)).sum(dim=0) / denom
                     z = self.outer_state_update(ctx.unsqueeze(0), z.unsqueeze(0)).squeeze(0)
                     z = self.outer_state_norm(z)
                     q_loop = qb + z.unsqueeze(0)
-                    h = self._run_inner(
+                    h, y_logits = self._run_inner(
                         h=h,
-                        h0=h0,
                         src=src,
                         dst=dst,
                         rel_h=rel_h,
-                        ones=ones,
+                        rel_h_inv=rel_h_inv,
                         q_inj=q_loop,
                         seed_mask=seed_i,
                         n=n,
                         e=e,
                     )
-                    y_logits = self.out_head(h).squeeze(-1)
 
             logits[i, :n] = y_logits
 
@@ -643,6 +740,32 @@ def _masked_bce_loss(
     loss = loss * mask.to(torch.float32)
     denom = mask.to(torch.float32).sum().clamp(min=1.0)
     return loss.sum() / denom
+
+
+def _masked_rearev_kl_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, int]:
+    # ReaRev-style objective:
+    # minimize KL( target_answer_distribution || predicted_entity_distribution )
+    # where both distributions are defined on valid subgraph nodes.
+    valid = mask.to(torch.bool)
+    logits_masked = logits.masked_fill(~valid, -1e9)
+    log_pred = F.log_softmax(logits_masked, dim=1)
+
+    tgt = targets.to(torch.float32) * valid.to(torch.float32)
+    tgt_sum = tgt.sum(dim=1, keepdim=True)
+    has_pos = tgt_sum.squeeze(-1) > 0
+
+    # Fallback keeps loss finite for malformed rows with no positive answer.
+    valid_cnt = valid.to(torch.float32).sum(dim=1, keepdim=True).clamp(min=1.0)
+    uniform = valid.to(torch.float32) / valid_cnt
+    tgt_dist = torch.where(has_pos.unsqueeze(-1), tgt / tgt_sum.clamp(min=1.0), uniform)
+    tgt_dist = tgt_dist / tgt_dist.sum(dim=1, keepdim=True).clamp(min=1e-12)
+
+    kl = F.kl_div(log_pred, tgt_dist, reduction="none").sum(dim=1)
+    return kl.mean(), int(has_pos.to(torch.int64).sum().item())
 
 
 def _masked_bce_hard_negative_loss(
@@ -743,20 +866,20 @@ def _sample_metrics_from_logits(
     gold_answers: Sequence[int],
     pred_topk: int,
     threshold: float,
-) -> Tuple[Optional[float], Optional[float]]:
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     gold = set(int(x) for x in gold_answers)
     if not gold:
-        return None, None
+        return None, None, None, None
 
     valid = torch.nonzero(mask_row, as_tuple=False).squeeze(-1)
     if valid.numel() <= 0:
-        return None, None
+        return None, None, None, None
 
     vals = torch.sigmoid(logits_row[valid])
     cids = node_cids_row[valid]
     keep = torch.nonzero(cids >= 0, as_tuple=False).squeeze(-1)
     if keep.numel() <= 0:
-        return None, None
+        return None, None, None, None
     vals = vals[keep]
     cids = cids[keep]
 
@@ -780,7 +903,7 @@ def _sample_metrics_from_logits(
     f1 = 0.0
     if (precision + recall) > 0.0:
         f1 = (2.0 * precision * recall) / (precision + recall)
-    return float(hit1), float(f1)
+    return float(hit1), float(f1), float(precision), float(recall)
 
 
 @torch.no_grad()
@@ -793,10 +916,12 @@ def evaluate_subgraph_reader(
     is_main: bool,
     desc: str = "Eval-Subgraph",
     return_counts: bool = False,
-) -> Tuple[float, float, int]:
+) -> Tuple[float, float, float, float, int]:
     model.eval()
     hit_sum = 0.0
     f1_sum = 0.0
+    precision_sum = 0.0
+    recall_sum = 0.0
     n_valid = 0
     skip = 0
 
@@ -817,7 +942,7 @@ def evaluate_subgraph_reader(
         )
         bsz = int(logits.shape[0])
         for i in range(bsz):
-            hit, f1 = _sample_metrics_from_logits(
+            hit, f1, precision, recall = _sample_metrics_from_logits(
                 logits_row=logits[i],
                 mask_row=batch_dev["node_mask"][i],
                 node_cids_row=batch_dev["node_cids"][i],
@@ -825,18 +950,22 @@ def evaluate_subgraph_reader(
                 pred_topk=pred_topk,
                 threshold=threshold,
             )
-            if hit is None or f1 is None:
+            if hit is None or f1 is None or precision is None or recall is None:
                 skip += 1
                 continue
             hit_sum += float(hit)
             f1_sum += float(f1)
+            precision_sum += float(precision)
+            recall_sum += float(recall)
             n_valid += 1
 
     mean_hit = float(hit_sum / max(1, n_valid))
     mean_f1 = float(f1_sum / max(1, n_valid))
+    mean_precision = float(precision_sum / max(1, n_valid))
+    mean_recall = float(recall_sum / max(1, n_valid))
     if return_counts:
-        return mean_hit, mean_f1, int(skip), int(n_valid)
-    return mean_hit, mean_f1, int(skip)
+        return mean_hit, mean_f1, mean_precision, mean_recall, int(skip), int(n_valid)
+    return mean_hit, mean_f1, mean_precision, mean_recall, int(skip)
 
 
 def _safe_load_state_dict(model: nn.Module, sd: dict) -> Tuple[int, int]:
@@ -888,6 +1017,9 @@ def _load_model_from_ckpt_or_init(
     gnn_variant: str = "rearev_bfs",
     rearev_num_instructions: int = 3,
     rearev_adapt_stages: int = 1,
+    rearev_normalized_gnn: bool = False,
+    rearev_latent_reasoning_enabled: bool = False,
+    rearev_latent_residual_alpha: float = 0.25,
 ) -> Tuple[RecursiveSubgraphReader, Optional[dict]]:
     meta = None
     if ckpt_path and os.path.exists(ckpt_path):
@@ -895,6 +1027,8 @@ def _load_model_from_ckpt_or_init(
         if isinstance(obj, dict):
             meta = obj
             model_cfg = obj.get("model_cfg", {})
+            if isinstance(model_cfg, dict) and "recursion_steps" in model_cfg:
+                recursion_steps = max(1, int(model_cfg.get("recursion_steps", recursion_steps)))
             if isinstance(model_cfg, dict) and "use_direction_embedding" in model_cfg:
                 use_direction_embedding = _as_bool(model_cfg.get("use_direction_embedding", False))
             if isinstance(model_cfg, dict) and "outer_reasoning_enabled" in model_cfg:
@@ -907,6 +1041,14 @@ def _load_model_from_ckpt_or_init(
                 rearev_num_instructions = int(model_cfg.get("rearev_num_instructions", 3))
             if isinstance(model_cfg, dict) and "rearev_adapt_stages" in model_cfg:
                 rearev_adapt_stages = int(model_cfg.get("rearev_adapt_stages", 1))
+            if isinstance(model_cfg, dict) and "rearev_normalized_gnn" in model_cfg:
+                rearev_normalized_gnn = _as_bool(model_cfg.get("rearev_normalized_gnn", False))
+            if isinstance(model_cfg, dict) and "rearev_latent_reasoning_enabled" in model_cfg:
+                rearev_latent_reasoning_enabled = _as_bool(
+                    model_cfg.get("rearev_latent_reasoning_enabled", False)
+                )
+            if isinstance(model_cfg, dict) and "rearev_latent_residual_alpha" in model_cfg:
+                rearev_latent_residual_alpha = float(model_cfg.get("rearev_latent_residual_alpha", 0.25))
 
     model = RecursiveSubgraphReader(
         entity_dim=entity_dim,
@@ -921,16 +1063,13 @@ def _load_model_from_ckpt_or_init(
         gnn_variant=str(gnn_variant),
         rearev_num_instructions=max(1, int(rearev_num_instructions)),
         rearev_adapt_stages=max(1, int(rearev_adapt_stages)),
+        rearev_normalized_gnn=bool(rearev_normalized_gnn),
+        rearev_latent_reasoning_enabled=bool(rearev_latent_reasoning_enabled),
+        rearev_latent_residual_alpha=float(max(0.0, rearev_latent_residual_alpha)),
     )
     if ckpt_path and os.path.exists(ckpt_path):
         obj = meta if meta is not None else torch.load(ckpt_path, map_location="cpu")
         sd = obj.get("model_state", obj) if isinstance(obj, dict) else obj
-        if isinstance(obj, dict):
-            meta = obj
-            model_cfg = obj.get("model_cfg", {})
-            if isinstance(model_cfg, dict):
-                if "recursion_steps" in model_cfg:
-                    model.recursion_steps = max(1, int(model_cfg["recursion_steps"]))
         _safe_load_state_dict(model, sd)
     return model, meta
 
@@ -951,10 +1090,17 @@ def train_subgraph_reader(
     hops = int(getattr(args, "subgraph_hops", 3))
     max_nodes = int(getattr(args, "subgraph_max_nodes", 256))
     max_edges = int(getattr(args, "subgraph_max_edges", 2048))
-    add_reverse_edges = _as_bool(getattr(args, "subgraph_add_reverse_edges", True))
+    add_reverse_edges = _as_bool(getattr(args, "subgraph_add_reverse_edges", False))
     recursion_steps = int(getattr(args, "subgraph_recursion_steps", 8))
     dropout = float(getattr(args, "subgraph_dropout", 0.1))
     threshold = float(getattr(args, "subgraph_pred_threshold", 0.5))
+    loss_mode_raw = str(getattr(args, "subgraph_loss_mode", "rearev_kl")).strip().lower()
+    if loss_mode_raw in {"rearev", "rearev_kl", "kl", "kl_div", "kld"}:
+        loss_mode = "rearev_kl"
+    elif loss_mode_raw in {"bce", "legacy_bce"}:
+        loss_mode = "bce"
+    else:
+        loss_mode = "rearev_kl"
     pos_weight_mode = str(getattr(args, "subgraph_pos_weight_mode", "auto")).strip().lower()
     if pos_weight_mode not in {"auto", "fixed", "off", "none", "disabled"}:
         pos_weight_mode = "auto"
@@ -971,12 +1117,27 @@ def train_subgraph_reader(
     gnn_variant = "rearev_bfs"
     rearev_num_instructions = max(1, int(getattr(args, "subgraph_rearev_num_ins", 3)))
     rearev_adapt_stages = max(1, int(getattr(args, "subgraph_rearev_adapt_stages", 1)))
+    rearev_normalized_gnn = _as_bool(getattr(args, "subgraph_rearev_normalized_gnn", False))
+    rearev_latent_reasoning_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_latent_reasoning_enabled", False)
+    )
+    rearev_latent_residual_alpha = max(
+        0.0, float(getattr(args, "subgraph_rearev_latent_residual_alpha", 0.25))
+    )
     ranking_enabled = _as_bool(getattr(args, "subgraph_ranking_enabled", False))
     ranking_weight = max(0.0, float(getattr(args, "subgraph_ranking_weight", 0.0)))
     ranking_margin = float(getattr(args, "subgraph_ranking_margin", 0.2))
     hard_negative_topk = max(1, int(getattr(args, "subgraph_hard_negative_topk", 16)))
     bce_hard_negative_enabled = _as_bool(getattr(args, "subgraph_bce_hard_negative_enabled", False))
     bce_hard_negative_topk = max(1, int(getattr(args, "subgraph_bce_hard_negative_topk", 64)))
+    if loss_mode == "rearev_kl":
+        # Keep training behavior aligned with ReaRev objective.
+        pos_weight_mode = "off"
+        fixed_pos_weight = 1.0
+        max_pos_weight = 1.0
+        ranking_enabled = False
+        ranking_weight = 0.0
+        bce_hard_negative_enabled = False
     lr_scheduler_mode = str(getattr(args, "subgraph_lr_scheduler", "none")).strip().lower()
     if lr_scheduler_mode not in {"none", "off", "disabled", "cosine", "step", "plateau"}:
         lr_scheduler_mode = "none"
@@ -1041,6 +1202,9 @@ def train_subgraph_reader(
         gnn_variant=gnn_variant,
         rearev_num_instructions=rearev_num_instructions,
         rearev_adapt_stages=rearev_adapt_stages,
+        rearev_normalized_gnn=rearev_normalized_gnn,
+        rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
+        rearev_latent_residual_alpha=rearev_latent_residual_alpha,
     )
     model.to(device)
     if is_ddp:
@@ -1113,8 +1277,12 @@ def train_subgraph_reader(
             f"outer_reasoning={outer_reasoning_enabled} "
             f"outer_steps={outer_reasoning_steps} "
             f"gnn_variant={gnn_variant} "
+            f"loss_mode={loss_mode} "
             f"rearev_num_ins={rearev_num_instructions} "
             f"rearev_adapt_stages={rearev_adapt_stages} "
+            f"rearev_normalized_gnn={rearev_normalized_gnn} "
+            f"rearev_latent={rearev_latent_reasoning_enabled} "
+            f"rearev_latent_alpha={rearev_latent_residual_alpha:.3f} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
             f"bce_hardneg={bce_hard_negative_enabled} "
@@ -1131,13 +1299,11 @@ def train_subgraph_reader(
         model.train()
         pbar = tqdm(loader, disable=not is_main, desc=f"Ep {ep} [Subgraph]")
         tot_loss = 0.0
-        tot_bce_loss = 0.0
+        tot_obj_loss = 0.0
         tot_rank_loss = 0.0
         steps = 0
-        pos_weight_sum = 0.0
-        pos_weight_n = 0
         rank_pairs_sum = 0
-        bce_keep_sum = 0
+        obj_aux_sum = 0
         optimizer_steps = 0
         opt.zero_grad(set_to_none=True)
         last_grad_norm = 0.0
@@ -1156,38 +1322,47 @@ def train_subgraph_reader(
                 edge_mask=batch_dev["edge_mask"],
                 q_emb=batch_dev["q_emb"],
             )
-            pos_weight_t = None
-            step_pos_weight = 1.0
-            if pos_weight_mode == "fixed":
-                step_pos_weight = max(1.0, float(fixed_pos_weight))
-                pos_weight_t = torch.tensor(step_pos_weight, dtype=logits.dtype, device=logits.device)
-            elif pos_weight_mode in {"off", "none", "disabled"}:
-                pos_weight_t = None
+
+            if loss_mode == "rearev_kl":
+                obj_loss, obj_aux = _masked_rearev_kl_loss(
+                    logits=logits,
+                    targets=batch_dev["node_labels"],
+                    mask=batch_dev["node_mask"],
+                )
                 step_pos_weight = 1.0
             else:
-                # auto mode: rebalance BCE by current masked positive/negative ratio.
-                # This prevents easy all-negative minima when positive labels are sparse.
-                with torch.no_grad():
-                    m = batch_dev["node_mask"].to(torch.float32)
-                    y = batch_dev["node_labels"].to(torch.float32)
-                    pos = (y * m).sum()
-                    tot = m.sum()
-                    neg = (tot - pos).clamp(min=0.0)
-                    if float(pos.item()) > 0.0:
-                        step_pos_weight = float((neg / pos).item())
-                    else:
-                        step_pos_weight = 1.0
-                step_pos_weight = float(max(1.0, min(max_pos_weight, step_pos_weight)))
-                pos_weight_t = torch.tensor(step_pos_weight, dtype=logits.dtype, device=logits.device)
+                pos_weight_t = None
+                step_pos_weight = 1.0
+                if pos_weight_mode == "fixed":
+                    step_pos_weight = max(1.0, float(fixed_pos_weight))
+                    pos_weight_t = torch.tensor(step_pos_weight, dtype=logits.dtype, device=logits.device)
+                elif pos_weight_mode in {"off", "none", "disabled"}:
+                    pos_weight_t = None
+                    step_pos_weight = 1.0
+                else:
+                    # auto mode: rebalance BCE by current masked positive/negative ratio.
+                    # This prevents easy all-negative minima when positive labels are sparse.
+                    with torch.no_grad():
+                        m = batch_dev["node_mask"].to(torch.float32)
+                        y = batch_dev["node_labels"].to(torch.float32)
+                        pos = (y * m).sum()
+                        tot = m.sum()
+                        neg = (tot - pos).clamp(min=0.0)
+                        if float(pos.item()) > 0.0:
+                            step_pos_weight = float((neg / pos).item())
+                        else:
+                            step_pos_weight = 1.0
+                    step_pos_weight = float(max(1.0, min(max_pos_weight, step_pos_weight)))
+                    pos_weight_t = torch.tensor(step_pos_weight, dtype=logits.dtype, device=logits.device)
 
-            bce_loss, bce_kept = _masked_bce_hard_negative_loss(
-                logits,
-                batch_dev["node_labels"],
-                batch_dev["node_mask"],
-                pos_weight=pos_weight_t,
-                hard_negative_enabled=bce_hard_negative_enabled,
-                hard_negative_topk=bce_hard_negative_topk,
-            )
+                obj_loss, obj_aux = _masked_bce_hard_negative_loss(
+                    logits,
+                    batch_dev["node_labels"],
+                    batch_dev["node_mask"],
+                    pos_weight=pos_weight_t,
+                    hard_negative_enabled=bce_hard_negative_enabled,
+                    hard_negative_topk=bce_hard_negative_topk,
+                )
             rank_loss = logits.new_tensor(0.0)
             rank_pairs = 0
             if ranking_enabled and ranking_weight > 0.0:
@@ -1198,7 +1373,7 @@ def train_subgraph_reader(
                     margin=ranking_margin,
                     hard_negative_topk=hard_negative_topk,
                 )
-            loss = bce_loss + (float(ranking_weight) * rank_loss)
+            loss = obj_loss + (float(ranking_weight) * rank_loss)
 
             if not torch.isfinite(loss):
                 if is_ddp:
@@ -1221,72 +1396,79 @@ def train_subgraph_reader(
 
             steps += 1
             tot_loss += float(loss.item())
-            tot_bce_loss += float(bce_loss.item())
+            tot_obj_loss += float(obj_loss.item())
             tot_rank_loss += float(rank_loss.item())
-            pos_weight_sum += float(step_pos_weight)
-            pos_weight_n += 1
             rank_pairs_sum += int(rank_pairs)
-            bce_keep_sum += int(bce_kept)
+            obj_aux_sum += int(obj_aux)
 
             if is_main:
-                pw = pos_weight_sum / max(1, pos_weight_n)
-                pbar.set_postfix_str(
-                    f"loss={loss.item():.4f} bce={bce_loss.item():.4f} rank={rank_loss.item():.4f} "
-                    f"avg={tot_loss/max(1,steps):.4f} pw={pw:.2f} grad={grad_norm_val:.2e}"
-                )
-                if wb is not None:
-                    wb.log(
-                        {
-                            "train/step_loss": float(loss.item()),
-                            "train/step_bce_loss": float(bce_loss.item()),
-                            "train/step_rank_loss": float(rank_loss.item()),
-                            "train/step_avg_loss": float(tot_loss / max(1, steps)),
-                            "train/step_pos_weight": float(pw),
-                            "train/step_rank_pairs": int(rank_pairs),
-                            "train/step_bce_kept_nodes": int(bce_kept),
-                            "train/grad_norm": float(grad_norm_val),
-                            "train/step_optimizer_steps": int(optimizer_steps),
-                            "train/epoch": int(ep),
-                            "train/step": int(steps),
-                        },
-                        step=(ep - 1) * max(1, len(loader)) + steps,
+                if loss_mode == "rearev_kl":
+                    pbar.set_postfix_str(
+                        f"loss={loss.item():.4f} kl={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                        f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
                     )
+                else:
+                    pbar.set_postfix_str(
+                        f"loss={loss.item():.4f} bce={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                        f"avg={tot_loss/max(1,steps):.4f} pw={step_pos_weight:.2f} grad={grad_norm_val:.2e}"
+                    )
+                if wb is not None:
+                    step_log = {
+                        "train/step_loss": float(loss.item()),
+                        "train/step_rank_loss": float(rank_loss.item()),
+                        "train/step_avg_loss": float(tot_loss / max(1, steps)),
+                        "train/step_rank_pairs": int(rank_pairs),
+                        "train/grad_norm": float(grad_norm_val),
+                        "train/step_optimizer_steps": int(optimizer_steps),
+                        "train/epoch": int(ep),
+                        "train/step": int(steps),
+                    }
+                    if loss_mode == "rearev_kl":
+                        step_log["train/step_kl_loss"] = float(obj_loss.item())
+                        step_log["train/step_kl_valid_rows"] = int(obj_aux)
+                    else:
+                        step_log["train/step_bce_loss"] = float(obj_loss.item())
+                        step_log["train/step_pos_weight"] = float(step_pos_weight)
+                        step_log["train/step_bce_kept_nodes"] = int(obj_aux)
+                    wb.log(step_log, step=(ep - 1) * max(1, len(loader)) + steps)
 
         epoch_loss = float(tot_loss)
-        epoch_bce_loss = float(tot_bce_loss)
+        epoch_obj_loss = float(tot_obj_loss)
         epoch_rank_loss = float(tot_rank_loss)
         epoch_steps = int(steps)
         epoch_rank_pairs = int(rank_pairs_sum)
-        epoch_bce_kept = int(bce_keep_sum)
+        epoch_obj_aux = int(obj_aux_sum)
         if is_ddp:
             agg = torch.tensor(
                 [
                     epoch_loss,
-                    epoch_bce_loss,
+                    epoch_obj_loss,
                     epoch_rank_loss,
                     float(epoch_steps),
                     float(epoch_rank_pairs),
-                    float(epoch_bce_kept),
+                    float(epoch_obj_aux),
                 ],
                 dtype=torch.float64,
                 device=device,
             )
             dist.all_reduce(agg, op=dist.ReduceOp.SUM)
             epoch_loss = float(agg[0].item())
-            epoch_bce_loss = float(agg[1].item())
+            epoch_obj_loss = float(agg[1].item())
             epoch_rank_loss = float(agg[2].item())
             epoch_steps = int(round(float(agg[3].item())))
             epoch_rank_pairs = int(round(float(agg[4].item())))
-            epoch_bce_kept = int(round(float(agg[5].item())))
+            epoch_obj_aux = int(round(float(agg[5].item())))
             dist.barrier()
 
         mean_loss = epoch_loss / max(1, epoch_steps)
-        mean_bce = epoch_bce_loss / max(1, epoch_steps)
+        mean_obj = epoch_obj_loss / max(1, epoch_steps)
         mean_rank = epoch_rank_loss / max(1, epoch_steps)
         mean_rank_pairs = float(epoch_rank_pairs) / max(1, epoch_steps)
-        mean_bce_kept = float(epoch_bce_kept) / max(1, epoch_steps)
+        mean_obj_aux = float(epoch_obj_aux) / max(1, epoch_steps)
         dev_hit = None
         dev_f1 = None
+        dev_precision = None
+        dev_recall = None
 
         if is_main:
             os.makedirs(args.out_dir, exist_ok=True)
@@ -1309,6 +1491,9 @@ def train_subgraph_reader(
                     "gnn_variant": str(gnn_variant),
                     "rearev_num_instructions": int(rearev_num_instructions),
                     "rearev_adapt_stages": int(rearev_adapt_stages),
+                    "rearev_normalized_gnn": bool(rearev_normalized_gnn),
+                    "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
+                    "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
                 },
                 "subgraph_cfg": {
                     "hops": int(hops),
@@ -1317,42 +1502,56 @@ def train_subgraph_reader(
                     "add_reverse_edges": bool(add_reverse_edges),
                     "split_reverse_relations": bool(split_reverse_relations),
                     "pred_threshold": float(threshold),
+                    "loss_mode": str(loss_mode),
                     "outer_reasoning_enabled": bool(outer_reasoning_enabled),
                     "outer_reasoning_steps": int(outer_reasoning_steps),
                     "gnn_variant": str(gnn_variant),
                     "rearev_num_instructions": int(rearev_num_instructions),
                     "rearev_adapt_stages": int(rearev_adapt_stages),
+                    "rearev_normalized_gnn": bool(rearev_normalized_gnn),
+                    "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
+                    "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
             torch.save(payload, ckpt)
             print(f"Saved {ckpt}")
 
-            print(
-                f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
-                f"bce={mean_bce:.4f} rank={mean_rank:.4f} "
-                f"rank_pairs/step={mean_rank_pairs:.2f} bce_kept/step={mean_bce_kept:.1f} "
-                f"opt_steps={optimizer_steps}"
-            )
-            if wb is not None:
-                wb.log(
-                    {
-                        "train/epoch_avg_loss": float(mean_loss),
-                        "train/epoch_avg_bce_loss": float(mean_bce),
-                        "train/epoch_avg_rank_loss": float(mean_rank),
-                        "train/epoch_avg_rank_pairs": float(mean_rank_pairs),
-                        "train/epoch_avg_bce_kept_nodes": float(mean_bce_kept),
-                        "train/epoch_optimizer_steps": int(optimizer_steps),
-                        "train/epoch": int(ep),
-                    },
-                    step=ep * max(1, len(loader)),
+            if loss_mode == "rearev_kl":
+                print(
+                    f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
+                    f"kl={mean_obj:.4f} rank={mean_rank:.4f} "
+                    f"rank_pairs/step={mean_rank_pairs:.2f} kl_valid_rows/step={mean_obj_aux:.1f} "
+                    f"opt_steps={optimizer_steps}"
                 )
+            else:
+                print(
+                    f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
+                    f"bce={mean_obj:.4f} rank={mean_rank:.4f} "
+                    f"rank_pairs/step={mean_rank_pairs:.2f} bce_kept/step={mean_obj_aux:.1f} "
+                    f"opt_steps={optimizer_steps}"
+                )
+            if wb is not None:
+                epoch_log = {
+                    "train/epoch_avg_loss": float(mean_loss),
+                    "train/epoch_avg_rank_loss": float(mean_rank),
+                    "train/epoch_avg_rank_pairs": float(mean_rank_pairs),
+                    "train/epoch_optimizer_steps": int(optimizer_steps),
+                    "train/epoch": int(ep),
+                }
+                if loss_mode == "rearev_kl":
+                    epoch_log["train/epoch_avg_kl_loss"] = float(mean_obj)
+                    epoch_log["train/epoch_avg_kl_valid_rows"] = float(mean_obj_aux)
+                else:
+                    epoch_log["train/epoch_avg_bce_loss"] = float(mean_obj)
+                    epoch_log["train/epoch_avg_bce_kept_nodes"] = float(mean_obj_aux)
+                wb.log(epoch_log, step=ep * max(1, len(loader)))
 
             eval_every = max(1, int(getattr(args, "eval_every_epochs", 1)))
             eval_start = max(1, int(getattr(args, "eval_start_epoch", 1)))
             should_eval = bool(dev_loader is not None) and ep >= eval_start and ((ep - eval_start) % eval_every == 0)
             if should_eval:
-                dev_hit, dev_f1, dev_skip = evaluate_subgraph_reader(
+                dev_hit, dev_f1, dev_precision, dev_recall, dev_skip = evaluate_subgraph_reader(
                     model=save_obj,
                     loader=dev_loader,
                     device=device,
@@ -1361,12 +1560,17 @@ def train_subgraph_reader(
                     is_main=True,
                     desc=f"Dev ep{ep} [Subgraph]",
                 )
-                print(f"[Dev-Subgraph] Hit@1={dev_hit:.4f} F1={dev_f1:.4f} Skip={dev_skip}")
+                print(
+                    f"[Dev-Subgraph] Hit@1={dev_hit:.4f} F1={dev_f1:.4f} "
+                    f"Precision={dev_precision:.4f} Recall={dev_recall:.4f} Skip={dev_skip}"
+                )
                 if wb is not None:
                     wb.log(
                         {
                             "dev/hit1": float(dev_hit),
                             "dev/f1": float(dev_f1),
+                            "dev/precision": float(dev_precision),
+                            "dev/recall": float(dev_recall),
                             "dev/skip": int(dev_skip),
                             "train/epoch": int(ep),
                         },
@@ -1466,6 +1670,26 @@ def test_subgraph_reader(args):
     rearev_adapt_stages = max(
         1, int(getattr(args, "subgraph_rearev_adapt_stages", model_cfg.get("rearev_adapt_stages", 1)))
     )
+    rearev_normalized_gnn = _as_bool(
+        getattr(args, "subgraph_rearev_normalized_gnn", model_cfg.get("rearev_normalized_gnn", False))
+    )
+    rearev_latent_reasoning_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_latent_reasoning_enabled",
+            model_cfg.get("rearev_latent_reasoning_enabled", False),
+        )
+    )
+    rearev_latent_residual_alpha = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "subgraph_rearev_latent_residual_alpha",
+                model_cfg.get("rearev_latent_residual_alpha", 0.25),
+            )
+        ),
+    )
 
     model = RecursiveSubgraphReader(
         entity_dim=ent_dim,
@@ -1480,6 +1704,9 @@ def test_subgraph_reader(args):
         gnn_variant=gnn_variant,
         rearev_num_instructions=rearev_num_instructions,
         rearev_adapt_stages=rearev_adapt_stages,
+        rearev_normalized_gnn=rearev_normalized_gnn,
+        rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
+        rearev_latent_residual_alpha=rearev_latent_residual_alpha,
     )
     sd = ckpt_obj.get("model_state", ckpt_obj) if isinstance(ckpt_obj, dict) else ckpt_obj
     skipped, missing = _safe_load_state_dict(model, sd)
@@ -1492,7 +1719,7 @@ def test_subgraph_reader(args):
     hops = int(getattr(args, "subgraph_hops", sub_cfg.get("hops", 3)))
     max_nodes = int(getattr(args, "subgraph_max_nodes", sub_cfg.get("max_nodes", 256)))
     max_edges = int(getattr(args, "subgraph_max_edges", sub_cfg.get("max_edges", 2048)))
-    add_reverse_edges = _as_bool(getattr(args, "subgraph_add_reverse_edges", sub_cfg.get("add_reverse_edges", True)))
+    add_reverse_edges = _as_bool(getattr(args, "subgraph_add_reverse_edges", sub_cfg.get("add_reverse_edges", False)))
     split_reverse_relations = _as_bool(
         getattr(args, "subgraph_split_reverse_relations", sub_cfg.get("split_reverse_relations", False))
     )
@@ -1541,24 +1768,36 @@ def test_subgraph_reader(args):
         desc="Test-Subgraph",
         return_counts=True,
     )
-    hit, f1, skip, n_valid = out
+    hit, f1, precision, recall, skip, n_valid = out
 
     if is_ddp:
         # Aggregate sums across ranks for exact global metrics.
         agg = torch.tensor(
-            [float(hit) * float(n_valid), float(f1) * float(n_valid), float(skip), float(n_valid)],
+            [
+                float(hit) * float(n_valid),
+                float(f1) * float(n_valid),
+                float(precision) * float(n_valid),
+                float(recall) * float(n_valid),
+                float(skip),
+                float(n_valid),
+            ],
             dtype=torch.float64,
             device=device,
         )
         dist.all_reduce(agg, op=dist.ReduceOp.SUM)
-        total_valid = int(round(float(agg[3].item())))
-        total_skip = int(round(float(agg[2].item())))
+        total_valid = int(round(float(agg[5].item())))
+        total_skip = int(round(float(agg[4].item())))
         hit = float(agg[0].item() / max(1, total_valid))
         f1 = float(agg[1].item() / max(1, total_valid))
+        precision = float(agg[2].item() / max(1, total_valid))
+        recall = float(agg[3].item() / max(1, total_valid))
         skip = total_skip
 
     if is_main:
-        print(f"[Test-Subgraph] Hit@1={hit:.4f} F1={f1:.4f} Skip={skip}")
+        print(
+            f"[Test-Subgraph] Hit@1={hit:.4f} F1={f1:.4f} "
+            f"Precision={precision:.4f} Recall={recall:.4f} Skip={skip}"
+        )
 
     if is_ddp:
         dist.barrier()
