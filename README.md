@@ -1,7 +1,7 @@
 # KGQA Recursive ReaRev (D / D+latent)
 
 This repository is configured for the **subgraph-reader ReaRev path only**.
-Full TRM model training/testing paths are intentionally disabled.
+
 
 - Subgraph variant is fixed to `rearev_bfs`.
 - Core training target is the D pipeline:
