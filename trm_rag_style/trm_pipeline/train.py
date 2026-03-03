@@ -134,6 +134,18 @@ def run(cfg):
         subgraph_rearev_trm_weight=float(
             cfg.get('subgraph_rearev_trm_weight', 1.0)
         ),
+        subgraph_deep_supervision_enabled=_as_bool(
+            cfg.get('subgraph_deep_supervision_enabled', False)
+        ),
+        subgraph_deep_supervision_weight=float(
+            cfg.get('subgraph_deep_supervision_weight', 0.0)
+        ),
+        subgraph_deep_supervision_ce_weight=float(
+            cfg.get('subgraph_deep_supervision_ce_weight', 1.0)
+        ),
+        subgraph_deep_supervision_halt_weight=float(
+            cfg.get('subgraph_deep_supervision_halt_weight', 1.0)
+        ),
         subgraph_dropout=float(cfg.get('subgraph_dropout', 0.1)),
         subgraph_pred_threshold=float(cfg.get('subgraph_pred_threshold', 0.5)),
         subgraph_loss_mode=str(cfg.get('subgraph_loss_mode', 'rearev_kl')),

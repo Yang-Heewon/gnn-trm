@@ -1413,6 +1413,18 @@ def train_subgraph_reader(
     rearev_trm_weight = max(
         0.0, float(getattr(args, "subgraph_rearev_trm_weight", 1.0))
     )
+    deep_supervision_enabled = _as_bool(
+        getattr(args, "subgraph_deep_supervision_enabled", False)
+    )
+    deep_supervision_weight = max(
+        0.0, float(getattr(args, "subgraph_deep_supervision_weight", 0.0))
+    )
+    deep_supervision_ce_weight = max(
+        0.0, float(getattr(args, "subgraph_deep_supervision_ce_weight", 1.0))
+    )
+    deep_supervision_halt_weight = max(
+        0.0, float(getattr(args, "subgraph_deep_supervision_halt_weight", 1.0))
+    )
     ranking_enabled = _as_bool(getattr(args, "subgraph_ranking_enabled", False))
     ranking_weight = max(0.0, float(getattr(args, "subgraph_ranking_weight", 0.0)))
     ranking_margin = float(getattr(args, "subgraph_ranking_margin", 0.2))
@@ -1422,6 +1434,10 @@ def train_subgraph_reader(
     uses_kl_objective = loss_mode in {"rearev_kl", "rearev_kl_rank"}
     uses_kl_trm_objective = loss_mode == "rearev_kl_trm"
     uses_trm_objective = loss_mode == "rearev_trm"
+    deep_supervision_active = bool(deep_supervision_enabled) and float(deep_supervision_weight) > 0.0
+    uses_kl_deep_supervision = (
+        deep_supervision_active and loss_mode in {"rearev_kl", "rearev_kl_rank"}
+    )
     if uses_trm_objective:
         rearev_trm_style_enabled = True
         ranking_enabled = False
@@ -1439,8 +1455,8 @@ def train_subgraph_reader(
         fixed_pos_weight = 1.0
         max_pos_weight = 1.0
     else:
-        # Keep legacy runs behavior stable unless the dedicated TRM objective is selected.
-        rearev_trm_style_enabled = False
+        # Legacy KL can optionally add TRM-style deep supervision as an auxiliary term.
+        rearev_trm_style_enabled = bool(uses_kl_deep_supervision)
     if uses_kl_objective:
         # Keep training behavior aligned with ReaRev objective.
         pos_weight_mode = "off"
@@ -1621,6 +1637,10 @@ def train_subgraph_reader(
             f"rearev_trm_halt_w={rearev_trm_halt_bce_weight:.3f} "
             f"rearev_trm_ce_w={rearev_trm_ce_weight:.3f} "
             f"rearev_trm_w={rearev_trm_weight:.3f} "
+            f"deep_sup={deep_supervision_enabled} "
+            f"deep_sup_w={deep_supervision_weight:.3f} "
+            f"deep_sup_ce_w={deep_supervision_ce_weight:.3f} "
+            f"deep_sup_halt_w={deep_supervision_halt_weight:.3f} "
             f"ddp_find_unused={ddp_find_unused} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
@@ -1662,9 +1682,13 @@ def train_subgraph_reader(
                 edge_dir=batch_dev.get("edge_dir", None),
                 edge_mask=batch_dev["edge_mask"],
                 q_emb=batch_dev["q_emb"],
-                return_aux=(uses_trm_objective or uses_kl_trm_objective),
+                return_aux=(
+                    uses_trm_objective
+                    or uses_kl_trm_objective
+                    or uses_kl_deep_supervision
+                ),
             )
-            if uses_trm_objective or uses_kl_trm_objective:
+            if uses_trm_objective or uses_kl_trm_objective or uses_kl_deep_supervision:
                 logits = model_out["logits"]
                 step_logits = model_out["step_logits"]
                 step_halt_logits = model_out["step_halt_logits"]
@@ -1728,6 +1752,23 @@ def train_subgraph_reader(
                     mask=batch_dev["node_mask"],
                 )
                 kl_component = obj_loss
+                if uses_kl_deep_supervision:
+                    trm_ce_component, trm_aux = _masked_trm_step_ce_loss(
+                        step_logits=step_logits,
+                        targets=batch_dev["node_labels"],
+                        mask=batch_dev["node_mask"],
+                        step_valid_mask=step_valid_mask,
+                    )
+                    halt_loss, halt_aux = _trm_halt_bce_loss(
+                        step_halt_logits=step_halt_logits,
+                        step_valid_mask=step_valid_mask,
+                    )
+                    trm_term = (
+                        float(deep_supervision_ce_weight) * trm_ce_component
+                        + float(deep_supervision_halt_weight) * halt_loss
+                    )
+                    obj_loss = kl_component + (float(deep_supervision_weight) * trm_term)
+                    halt_aux += int(trm_aux)
                 step_pos_weight = 1.0
             else:
                 pos_weight_t = None
@@ -1815,6 +1856,13 @@ def train_subgraph_reader(
                         f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
                         f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
                     )
+                elif uses_kl_objective and uses_kl_deep_supervision:
+                    pbar.set_postfix_str(
+                        f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                        f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
+                        f"rank={rank_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                        f"grad={grad_norm_val:.2e}"
+                    )
                 elif uses_kl_objective:
                     pbar.set_postfix_str(
                         f"loss={loss.item():.4f} kl={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
@@ -1848,6 +1896,13 @@ def train_subgraph_reader(
                         step_log["train/step_trm_halt_component"] = float(halt_loss.item())
                         step_log["train/step_kl_valid_rows"] = int(obj_aux)
                         step_log["train/step_trm_halt_valid_steps"] = int(halt_aux)
+                    elif uses_kl_objective and uses_kl_deep_supervision:
+                        step_log["train/step_kl_ds_loss"] = float(obj_loss.item())
+                        step_log["train/step_kl_component"] = float(kl_component.item())
+                        step_log["train/step_ds_trm_ce_component"] = float(trm_ce_component.item())
+                        step_log["train/step_ds_halt_component"] = float(halt_loss.item())
+                        step_log["train/step_kl_valid_rows"] = int(obj_aux)
+                        step_log["train/step_ds_halt_valid_steps"] = int(halt_aux)
                     elif uses_kl_objective:
                         step_log["train/step_kl_loss"] = float(obj_loss.item())
                         step_log["train/step_kl_valid_rows"] = int(obj_aux)
@@ -1963,6 +2018,10 @@ def train_subgraph_reader(
                     "rearev_trm_halt_bce_weight": float(rearev_trm_halt_bce_weight),
                     "rearev_trm_ce_weight": float(rearev_trm_ce_weight),
                     "rearev_trm_weight": float(rearev_trm_weight),
+                    "deep_supervision_enabled": bool(deep_supervision_enabled),
+                    "deep_supervision_weight": float(deep_supervision_weight),
+                    "deep_supervision_ce_weight": float(deep_supervision_ce_weight),
+                    "deep_supervision_halt_weight": float(deep_supervision_halt_weight),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
@@ -1982,6 +2041,13 @@ def train_subgraph_reader(
                     f"kl+trm={mean_obj:.4f} halt={mean_halt:.4f} "
                     f"kl_rows/step={mean_obj_aux:.1f} trm_steps/step={mean_halt_aux:.1f} "
                     f"opt_steps={optimizer_steps}"
+                )
+            elif uses_kl_objective and uses_kl_deep_supervision:
+                print(
+                    f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
+                    f"kl+ds={mean_obj:.4f} halt={mean_halt:.4f} rank={mean_rank:.4f} "
+                    f"rank_pairs/step={mean_rank_pairs:.2f} kl_valid_rows/step={mean_obj_aux:.1f} "
+                    f"ds_steps/step={mean_halt_aux:.1f} opt_steps={optimizer_steps}"
                 )
             elif uses_kl_objective:
                 print(
@@ -2015,6 +2081,11 @@ def train_subgraph_reader(
                     epoch_log["train/epoch_avg_trm_halt_loss"] = float(mean_halt)
                     epoch_log["train/epoch_avg_kl_valid_rows"] = float(mean_obj_aux)
                     epoch_log["train/epoch_avg_trm_valid_steps"] = float(mean_halt_aux)
+                elif uses_kl_objective and uses_kl_deep_supervision:
+                    epoch_log["train/epoch_avg_kl_ds_loss"] = float(mean_obj)
+                    epoch_log["train/epoch_avg_ds_halt_loss"] = float(mean_halt)
+                    epoch_log["train/epoch_avg_kl_valid_rows"] = float(mean_obj_aux)
+                    epoch_log["train/epoch_avg_ds_valid_steps"] = float(mean_halt_aux)
                 elif uses_kl_objective:
                     epoch_log["train/epoch_avg_kl_loss"] = float(mean_obj)
                     epoch_log["train/epoch_avg_kl_valid_rows"] = float(mean_obj_aux)
