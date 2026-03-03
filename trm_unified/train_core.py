@@ -502,7 +502,7 @@ def build_model(model_impl: str, trm_root: str, cfg: dict):
     if not os.path.isdir(trm_root):
         raise FileNotFoundError(
             f"TRM root not found: {trm_root}. "
-            "Set --trm_root or TRM_ROOT to your TinyRecursiveModels path."
+            "Set --trm_root or TRM_ROOT to a valid model source path."
         )
     if trm_root not in os.sys.path:
         os.sys.path.append(trm_root)
@@ -1204,6 +1204,10 @@ def train(args):
         if wb is not None:
             wb.finish()
         return
+    raise RuntimeError(
+        "This workspace is configured for subgraph-reader-only training "
+        "(D / D+latent). Set subgraph_reader_enabled=true."
+    )
 
     # Full-dev evaluation on rank0 while other DDP ranks wait at barrier can
     # hit process-group timeout when eval_limit=-1 and timeout is too small.
@@ -2267,6 +2271,10 @@ def test(args):
 
         test_subgraph_reader(args)
         return
+    raise RuntimeError(
+        "This workspace is configured for subgraph-reader-only testing "
+        "(D / D+latent). Set subgraph_reader_enabled=true."
+    )
 
     # Full relation-path beam traversal evaluation:
     # start-entity -> predicted end-entity, measured by Hit@1/F1.

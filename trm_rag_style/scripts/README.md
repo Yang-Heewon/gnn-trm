@@ -6,7 +6,7 @@ This repository is now configured to run the **ReaRev-only** subgraph reader pat
 - Subgraph variant is fixed to `rearev_bfs` during train/test.
 - Recursion depth is controlled by `SUBGRAPH_RECURSION_STEPS`.
 
-## Core Scripts
+## Core Scripts (D / D+latent)
 
 - `run_download.sh`
   - Download/prepare dataset files.
@@ -14,27 +14,20 @@ This repository is now configured to run the **ReaRev-only** subgraph reader pat
 - `run_embed.sh`
   - Build entity/relation/query embeddings.
 
-- `run_train_subgraph_v2_resume.sh`
-  - ReaRev subgraph reader training (script name is legacy).
-  - Supports resume via `CKPT` and `SUBGRAPH_RESUME_EPOCH`.
+- `run_rearev_d_gpu01_hit06.sh`
+  - D phase1 training launcher (supports latent/gate/fusion/halt + KL deep supervision).
 
-- `run_train_subgraph_outer_yz_resume.sh`
-  - ReaRev subgraph reader with optional outer latent loop controls.
-  - Supports:
-    - `FROM_SCRATCH=true` (fresh training)
-    - `FROM_SCRATCH=false` (resume fine-tune)
-    - cosine scheduling + gradient accumulation.
+- `run_rearev_d_auto_fallback_4to2.sh`
+  - Auto fallback wrapper: try 4-GPU run, fallback to 2-GPU on OOM.
+
+- `run_rearev_d_phase2_resume.sh`
+  - D phase2 resume launcher (BCE + ranking + hard negatives).
+
+- `run_rearev_d_two_phase_auto.sh`
+  - Two-phase D pipeline (phase1 select best checkpoint -> phase2 fine-tune).
 
 - `run_test.sh`
   - Test entrypoint for ReaRev subgraph checkpoints.
-
-## Utilities
-
-- `run_select_subgraph_ckpt_devtest_gap.sh`
-  - Evaluate epoch-range checkpoints and rank by dev/test consistency.
-
-- `run_select_and_finetune_subgraph.sh`
-  - Selection + fine-tuning helper.
 
 ## Important Env Vars
 
@@ -46,9 +39,10 @@ This repository is now configured to run the **ReaRev-only** subgraph reader pat
   - `HIDDEN_SIZE`, `SUBGRAPH_RECURSION_STEPS`
   - `SUBGRAPH_REAREV_NUM_INS`, `SUBGRAPH_REAREV_ADAPT_STAGES`
   - `SUBGRAPH_MAX_NODES`, `SUBGRAPH_MAX_EDGES`
-  - `SUBGRAPH_OUTER_REASONING_STEPS`
   - `SUBGRAPH_RANKING_ENABLED`, `SUBGRAPH_BCE_HARD_NEGATIVE_ENABLED`
   - `SUBGRAPH_GRAD_ACCUM_STEPS`
+  - `SUBGRAPH_DEEP_SUPERVISION_ENABLED`, `SUBGRAPH_DEEP_SUPERVISION_WEIGHT`
+  - `SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT`, `SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT`
 - Optimization:
   - `LR`, `SUBGRAPH_LR_SCHEDULER`, `SUBGRAPH_LR_MIN`
 
@@ -56,7 +50,7 @@ This repository is now configured to run the **ReaRev-only** subgraph reader pat
 
 ```bash
 cd /data2/workspace/heewon/KGQA
-bash trm_rag_style/scripts/run_train_subgraph_outer_yz_resume.sh
+bash trm_rag_style/scripts/run_rearev_d_auto_fallback_4to2.sh
 ```
 
 Then override env vars as needed.

@@ -57,7 +57,7 @@ def normalize_config_paths(cfg):
     cfg['workspace_root'] = workspace_root
 
     if not cfg.get('trm_root'):
-        cfg['trm_root'] = os.environ.get('TRM_ROOT', 'TinyRecursiveModels')
+        cfg['trm_root'] = os.environ.get('TRM_ROOT', '.')
 
     path_keys = [
         'trm_root',

@@ -1,6 +1,6 @@
 {
   "workspace_root": ".",
-  "trm_root": "TinyRecursiveModels",
+  "trm_root": ".",
   "trm_tokenizer": "intfloat/multilingual-e5-large",
   "entity_names_json": "data/data/entities_names.json",
   "emb_tag": "e5",
