@@ -134,3 +134,79 @@ bash trm_rag_style/scripts/run_test.sh
 - `SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT` (default `0.3~1.0`)
 - `SUBGRAPH_REAREV_TRM_TMINUS1_NO_GRAD` (`false` for full-step gradient)
 - `SUBGRAPH_REAREV_TRM_DETACH_CARRY` (`false` for full-step gradient)
+
+## 8) Quick Recipes (D / D+latent)
+
+### A) D Baseline (two-phase auto)
+
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=d_baseline_4gpu \
+WANDB_MODE=online \
+WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
+PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
+MASTER_PORT=29781 PHASE2_MASTER_PORT=29791 \
+EPOCHS=16 PHASE2_EPOCHS=5 \
+bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
+```
+
+### B) D+latent (KL + deep supervision in phase1)
+
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=d_latent_ds_4gpu \
+WANDB_MODE=online \
+WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
+PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
+MASTER_PORT=29811 PHASE2_MASTER_PORT=29821 \
+EPOCHS=16 PHASE2_EPOCHS=5 \
+PHASE1_SUBGRAPH_LOSS_MODE=rearev_kl \
+PHASE1_SUBGRAPH_DEEP_SUPERVISION_ENABLED=true \
+PHASE1_SUBGRAPH_DEEP_SUPERVISION_WEIGHT=0.03 \
+PHASE1_SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT=1.0 \
+PHASE1_SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT=0.3 \
+PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
+PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
+PHASE1_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA=0.25 \
+bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
+```
+
+### C) Batch=1 for both phases
+
+Use these two variables together:
+
+- `BATCH_SIZE=1`
+- `PHASE2_BATCH_SIZE=1`
+
+Optionally keep effective batch with accumulation:
+
+- `SUBGRAPH_GRAD_ACCUM_STEPS=8`
+- `PHASE2_SUBGRAPH_GRAD_ACCUM_STEPS=8`
+
+## 9) Path Trace During Test
+
+To print and dump multi-hop explicit paths:
+
+```bash
+cd /data2/workspace/heewon/KGQA
+CKPT=/path/to/model_epXX.pt
+CUDA_VISIBLE_DEVICES=0 \
+python -m trm_agent.run \
+  --dataset cwq \
+  --model_impl trm_hier6 \
+  --stage test \
+  --ckpt "$CKPT" \
+  --override \
+    subgraph_reader_enabled=true \
+    emb_tag=e5_w4_g4 \
+    wandb_mode=offline \
+    subgraph_trace_relation_topk_enabled=true \
+    subgraph_trace_relation_topk=5 \
+    subgraph_trace_log_examples=5 \
+    subgraph_trace_dump_max_examples=1000 \
+    subgraph_trace_path_dump_jsonl=logs/trace/test_paths.jsonl
+```
