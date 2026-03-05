@@ -82,6 +82,8 @@ Important stability option:
 - `subgraph_kl_no_positive_mode=skip`
   - if no positive node exists in the current row/subgraph, KL for that row is skipped
   - avoids uniform-target over-regularization on no-positive rows
+- `subgraph_kl_supervision_mode=step_uniform`
+  - apply ReaRev KL at every supervised step (uniform average), not only final logits
 
 Optional deep supervision (this repo addition):
 
@@ -148,6 +150,12 @@ Two-phase automation:
 bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
 ```
 
+Phase 1 only (asymmetric `y/z` + `KL/Halt` only):
+
+```bash
+bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
+```
+
 Test:
 
 ```bash
@@ -198,6 +206,7 @@ PHASE1_SUBGRAPH_DEEP_SUPERVISION_WEIGHT=0.03 \
 PHASE1_SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT=1.0 \
 PHASE1_SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT=0.3 \
 PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
+PHASE1_SUBGRAPH_KL_SUPERVISION_MODE=step_uniform \
 PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
 PHASE1_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA=0.25 \
 bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
@@ -259,3 +268,73 @@ python -m trm_agent.run \
     subgraph_trace_dump_max_examples=1000 \
     subgraph_trace_path_dump_jsonl=logs/trace/test_paths.jsonl
 ```
+
+## 10) Phase1-Only Asymmetric `y/z` Module (Isolated Training)
+
+This is a dedicated training path for the asymmetric continuous latent recursion module only.
+It does **not** execute phase2.
+
+- Script: `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
+- Default objective:
+  - `subgraph_loss_mode=rearev_kl_halt`
+  - `subgraph_kl_supervision_mode=step_uniform`
+  - `subgraph_rearev_asymmetric_yz_enabled=true`
+  - `subgraph_ranking_enabled=false`
+  - `subgraph_bce_hard_negative_enabled=false`
+
+### Module Structure (Asymmetric `y/z`)
+
+For one sample, with `A=adapt_stages`, `R=recursion_steps`, `I=num_instructions`:
+
+1. Input projection
+   - `h0 = node_proj(x_node)`
+   - `q = q_proj(x_q)`
+   - `rel = rel_proj(x_rel)`
+2. Initialize latent/answer states
+   - `z0` (latent global state)
+   - `y0` (seed-based node logits/distribution)
+3. Outer stage loop (`A`)
+   - Inner recursion loop (`R`): run ReaRev message passing with `I` instructions
+     - relation-aware forward/inverse aggregation
+     - update `h` and `z`
+   - Stage-end answer update (asymmetric)
+     - update `y` once from `(y_prev, z_updated, h)`
+4. Collect supervision tensors (`step_logits`, `step_halt_logits`)
+
+Operational counts per sample:
+
+- message passing pair calls: `A * R * I`
+- `z` updates: `A * R`
+- `y` updates (asymmetric mode): `A`
+
+### Loss Applied
+
+At training step:
+
+- `L_total = L_KL + w_halt * L_halt`
+- `L_KL`: step-uniform KL over supervised stage outputs
+- `L_halt`: BCE over halt logits at supervised stage outputs
+
+Then one backward pass per mini-batch:
+
+- `L_total.backward()`
+- optimizer step follows gradient accumulation setting
+
+### Run Example (4 GPUs, phase1 only)
+
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=phase1_asym_only_v1 \
+WANDB_MODE=online \
+WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
+MASTER_PORT=29901 FALLBACK_MASTER_PORT=29902 \
+bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
+```
+
+Start-line sanity check:
+
+- `loss_mode=rearev_kl_halt`
+- `rearev_asym_yz=True`
+- `kl_sup=step_uniform`

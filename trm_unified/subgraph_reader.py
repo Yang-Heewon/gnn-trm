@@ -523,8 +523,21 @@ class RecursiveSubgraphReader(nn.Module):
         if self.rearev_asymmetric_yz_enabled:
             # Asymmetric y-update gate: combines current latent state z and previous y-context.
             self.rearev_yz_update_gate = nn.Linear(self.hidden_size * 2, 1)
+            # Residual y-update head: y_new = y_old + delta(h_final, z_final, y_old).
+            self.rearev_y_delta_head = nn.Sequential(
+                nn.Linear(self.hidden_size * 2 + 1, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, 1),
+            )
+            # Optional cycle-level halt head over (z_global, y_context).
+            if self.rearev_dynamic_halting_enabled or self.rearev_trm_style_enabled:
+                self.rearev_halt_with_y_proj = nn.Linear(self.hidden_size * 2, 1)
+            else:
+                self.rearev_halt_with_y_proj = None
         else:
             self.rearev_yz_update_gate = None
+            self.rearev_y_delta_head = None
+            self.rearev_halt_with_y_proj = None
         if self.outer_reasoning_enabled:
             self.outer_state_update = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
@@ -539,6 +552,27 @@ class RecursiveSubgraphReader(nn.Module):
             fusion_delta = self.rearev_score_fusion(self.dropout(fuse_in)).squeeze(-1)
             return base_score + fusion_delta
         return base_score
+
+    def _halt_logit(
+        self,
+        z: torch.Tensor,
+        h: Optional[torch.Tensor] = None,
+        y_dist: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            self.rearev_asymmetric_yz_enabled
+            and self.rearev_halt_with_y_proj is not None
+            and h is not None
+            and y_dist is not None
+            and int(h.shape[0]) > 0
+            and int(y_dist.shape[0]) == int(h.shape[0])
+        ):
+            y_ctx = (h * y_dist.unsqueeze(-1)).sum(dim=0)
+            halt_in = torch.cat([z, y_ctx], dim=-1).unsqueeze(0)
+            return self.rearev_halt_with_y_proj(halt_in).squeeze()
+        if self.rearev_halt_proj is not None:
+            return self.rearev_halt_proj(z).squeeze(-1)
+        return z.new_zeros(())
 
     def _seed_distribution(
         self,
@@ -637,15 +671,24 @@ class RecursiveSubgraphReader(nn.Module):
         seed_dist = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
         edge_w = self._edge_weights(src=src, n=n, e=e, dtype=h.dtype, device=h.device)
         latent_state = q_state
+        if self.rearev_asymmetric_yz_enabled:
+            # TRM-style asymmetric mode uses explicit global latent scratchpad initialized at zero.
+            latent_state = torch.zeros_like(q_state)
 
         h_stage = h
-        score_tp = self._score_nodes(h_stage, latent_state)
-        curr_dist = seed_dist
+        if self.rearev_asymmetric_yz_enabled:
+            # y is explicitly initialized from seed entities.
+            score_tp = torch.log(seed_dist.clamp(min=1e-8))
+            curr_dist = torch.softmax(score_tp, dim=0)
+        else:
+            score_tp = self._score_nodes(h_stage, latent_state)
+            curr_dist = seed_dist
         trm_step_logits: List[torch.Tensor] = []
         trm_step_halt_logits: List[torch.Tensor] = []
         trm_step_valid: List[torch.Tensor] = []
         trace_step_logits: List[torch.Tensor] = []
         trace_step_edge_importance: List[torch.Tensor] = []
+        outer_should_break = False
         for stage_idx in range(self.rearev_adapt_stages):
             y_prev_score = score_tp
             y_prev_dist = curr_dist
@@ -674,6 +717,10 @@ class RecursiveSubgraphReader(nn.Module):
                 score_for_trace = score_tp
                 with step_ctx():
                     neighbor_reps: List[torch.Tensor] = []
+                    h_in = h_stage
+                    if self.rearev_asymmetric_yz_enabled:
+                        # Inject current y distribution into node state before message passing.
+                        h_in = h_stage * (1.0 + reason_dist.unsqueeze(-1))
                     step_edge_importance = (
                         h_stage.new_zeros((e,), dtype=h_stage.dtype, device=h_stage.device)
                         if (return_rel_trace and e > 0)
@@ -691,7 +738,7 @@ class RecursiveSubgraphReader(nn.Module):
                             edge_w=edge_w,
                             n=n,
                             e=e,
-                            ref_h=h_stage,
+                            ref_h=h_in,
                             return_edge_strength=return_rel_trace,
                         )
                         neighbor_reps.append(agg_fwd)
@@ -702,7 +749,7 @@ class RecursiveSubgraphReader(nn.Module):
                     prev_score = score_tp
                     prev_dist = curr_dist
                     prev_latent = latent_state
-                    next_local_entity_emb = torch.cat([h_stage] + neighbor_reps, dim=-1)
+                    next_local_entity_emb = torch.cat([h_in] + neighbor_reps, dim=-1)
                     h_msg = F.relu(e2e_linear(self.dropout(next_local_entity_emb)))
                     if self.rearev_global_gate_enabled and self.rearev_global_gate is not None:
                         z_expand = prev_latent.unsqueeze(0).expand(prev_h.shape[0], -1)
@@ -720,13 +767,17 @@ class RecursiveSubgraphReader(nn.Module):
                         and self.rearev_latent_gru is not None
                         and self.rearev_latent_norm is not None
                     ):
-                        ctx = (h_candidate * dist_candidate.unsqueeze(-1)).sum(dim=0)
+                        if self.rearev_asymmetric_yz_enabled:
+                            # In asymmetric mode, z-refinement does not depend on new y; use plain context.
+                            ctx = h_candidate.mean(dim=0)
+                        else:
+                            ctx = (h_candidate * dist_candidate.unsqueeze(-1)).sum(dim=0)
                         latent_candidate = self.rearev_latent_gru(
                             ctx.unsqueeze(0),
                             prev_latent.unsqueeze(0),
                         ).squeeze(0)
                         latent_candidate = self.rearev_latent_norm(latent_candidate)
-                    if self.rearev_dynamic_halting_enabled:
+                    if self.rearev_dynamic_halting_enabled and (not self.rearev_asymmetric_yz_enabled):
                         alive_before = alive_prob
                         p_halt = h_stage.new_tensor(0.0)
                         if self.rearev_halt_proj is not None:
@@ -778,10 +829,7 @@ class RecursiveSubgraphReader(nn.Module):
                     or ((stage_idx + 1) >= self.rearev_adapt_stages)
                 ):
                     trm_step_logits.append(score_tp)
-                    if self.rearev_halt_proj is not None:
-                        trm_step_halt_logits.append(self.rearev_halt_proj(latent_state).squeeze(-1))
-                    else:
-                        trm_step_halt_logits.append(score_tp.new_zeros(()))
+                    trm_step_halt_logits.append(self._halt_logit(latent_state, h_stage, curr_dist))
                     trm_step_valid.append(torch.ones((), dtype=torch.bool, device=score_tp.device))
                     if (
                         self.training
@@ -798,26 +846,31 @@ class RecursiveSubgraphReader(nn.Module):
 
             if self.rearev_asymmetric_yz_enabled:
                 # Outer y-update: after inner z refinement loops, update y exactly once.
-                score_candidate_outer = self._score_nodes(h_stage, latent_state)
+                z_expand = latent_state.unsqueeze(0).expand(h_stage.shape[0], -1)
+                y_prev_col = y_prev_score.unsqueeze(-1)
+                if self.rearev_y_delta_head is not None:
+                    delta_in = torch.cat([h_stage, z_expand, y_prev_col], dim=-1)
+                    y_delta = self.rearev_y_delta_head(self.dropout(delta_in)).squeeze(-1)
+                else:
+                    y_delta = self._score_nodes(h_stage, latent_state)
+                y_candidate_outer = y_prev_score + y_delta
                 y_ctx = (h_stage * y_prev_dist.unsqueeze(-1)).sum(dim=0)
                 if self.rearev_yz_update_gate is not None:
                     gate_in = torch.cat([latent_state, y_ctx], dim=-1).unsqueeze(0)
                     update_ratio = torch.sigmoid(self.rearev_yz_update_gate(gate_in)).view(())
                     update_ratio = update_ratio.clamp(min=0.0, max=1.0)
                 else:
-                    update_ratio = score_candidate_outer.new_tensor(1.0)
-                score_tp = update_ratio * score_candidate_outer + (1.0 - update_ratio) * y_prev_score
+                    update_ratio = y_candidate_outer.new_tensor(1.0)
+                score_tp = update_ratio * y_candidate_outer + (1.0 - update_ratio) * y_prev_score
                 curr_dist = torch.softmax(score_tp, dim=0)
+                halt_logit_cycle = self._halt_logit(latent_state, h_stage, curr_dist)
 
                 if self.rearev_trm_style_enabled and (
                     self.rearev_trm_supervise_all_stages
                     or ((stage_idx + 1) >= self.rearev_adapt_stages)
                 ):
                     trm_step_logits.append(score_tp)
-                    if self.rearev_halt_proj is not None:
-                        trm_step_halt_logits.append(self.rearev_halt_proj(latent_state).squeeze(-1))
-                    else:
-                        trm_step_halt_logits.append(score_tp.new_zeros(()))
+                    trm_step_halt_logits.append(halt_logit_cycle)
                     trm_step_valid.append(torch.ones((), dtype=torch.bool, device=score_tp.device))
                     if (
                         self.training
@@ -828,8 +881,17 @@ class RecursiveSubgraphReader(nn.Module):
                         score_tp = score_tp.detach()
                         curr_dist = curr_dist.detach()
                         latent_state = latent_state.detach()
+                if (
+                    self.rearev_dynamic_halting_enabled
+                    and ((not self.training) or self.rearev_act_stop_in_train)
+                    and ((stage_idx + 1) >= self.rearev_dynamic_halting_min_steps)
+                    and float(torch.sigmoid(halt_logit_cycle).detach().item()) >= self.rearev_dynamic_halting_threshold
+                ):
+                    outer_should_break = True
 
             if stage_idx + 1 >= self.rearev_adapt_stages:
+                break
+            if outer_should_break:
                 break
             if self.rearev_reforms is not None:
                 updated: List[torch.Tensor] = []
@@ -1102,6 +1164,52 @@ def _masked_rearev_kl_loss(
     tgt_dist = tgt_dist / tgt_dist.sum(dim=1, keepdim=True).clamp(min=1e-12)
     kl = F.kl_div(log_pred, tgt_dist, reduction="none").sum(dim=1)
     return kl.mean(), int(has_pos.to(torch.int64).sum().item())
+
+
+def _masked_rearev_step_kl_loss(
+    step_logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    step_valid_mask: torch.Tensor,
+    no_positive_mode: str = "uniform",
+) -> Tuple[torch.Tensor, int]:
+    # Step-wise ReaRev KL:
+    # apply KL(target_dist || pred_dist_t) at each supervised step and average uniformly.
+    bsz = int(step_logits.shape[0])
+    num_steps = int(step_logits.shape[1])
+    losses: List[torch.Tensor] = []
+    valid_rows = 0
+    mode = str(no_positive_mode or "uniform").strip().lower()
+    skip_no_pos = mode in {"skip", "mask", "drop"}
+
+    for i in range(bsz):
+        valid = mask[i].to(torch.bool)
+        if int(valid.to(torch.int64).sum().item()) <= 0:
+            continue
+        tgt = targets[i].to(torch.float32) * valid.to(torch.float32)
+        tgt_sum = float(tgt.sum().item())
+        has_pos = tgt_sum > 0.0
+        if (not has_pos) and skip_no_pos:
+            continue
+        if has_pos:
+            tgt_dist = tgt / max(tgt_sum, 1.0)
+            valid_rows_base = 1
+        else:
+            denom = valid.to(torch.float32).sum().clamp(min=1.0)
+            tgt_dist = valid.to(torch.float32) / denom
+            valid_rows_base = 0
+        tgt_dist = tgt_dist / tgt_dist.sum().clamp(min=1e-12)
+
+        for t in range(num_steps):
+            if not bool(step_valid_mask[i, t].item()):
+                continue
+            log_pred_t = F.log_softmax(step_logits[i, t].masked_fill(~valid, -1e9), dim=0)
+            losses.append(F.kl_div(log_pred_t, tgt_dist, reduction="sum"))
+            valid_rows += int(valid_rows_base)
+
+    if not losses:
+        return step_logits.new_tensor(0.0), 0
+    return torch.stack(losses).mean(), int(valid_rows)
 
 
 def _masked_trm_step_ce_loss(
@@ -1871,6 +1979,8 @@ def train_subgraph_reader(
         loss_mode = "rearev_kl"
     elif loss_mode_raw in {"rearev_kl_rank", "kl_rank", "rearev_hybrid", "hybrid_kl_rank"}:
         loss_mode = "rearev_kl_rank"
+    elif loss_mode_raw in {"rearev_kl_halt", "kl_halt", "hybrid_kl_halt"}:
+        loss_mode = "rearev_kl_halt"
     elif loss_mode_raw in {"rearev_kl_trm", "kl_trm", "hybrid_kl_trm"}:
         loss_mode = "rearev_kl_trm"
     elif loss_mode_raw in {"rearev_trm", "trm", "trm_ce_halt", "trm_latent"}:
@@ -1965,14 +2075,30 @@ def train_subgraph_reader(
     kl_no_positive_mode = str(getattr(args, "subgraph_kl_no_positive_mode", "uniform")).strip().lower()
     if kl_no_positive_mode not in {"uniform", "skip", "mask", "drop"}:
         kl_no_positive_mode = "uniform"
+    kl_supervision_mode = str(getattr(args, "subgraph_kl_supervision_mode", "final")).strip().lower()
+    if kl_supervision_mode not in {"final", "step_uniform"}:
+        kl_supervision_mode = "final"
     uses_kl_objective = loss_mode in {"rearev_kl", "rearev_kl_rank"}
+    uses_kl_halt_objective = loss_mode == "rearev_kl_halt"
     uses_kl_trm_objective = loss_mode == "rearev_kl_trm"
     uses_trm_objective = loss_mode == "rearev_trm"
     deep_supervision_active = bool(deep_supervision_enabled) and float(deep_supervision_weight) > 0.0
     uses_kl_deep_supervision = (
         deep_supervision_active and loss_mode in {"rearev_kl", "rearev_kl_rank"}
     )
+    uses_kl_step_uniform = (
+        (uses_kl_objective or uses_kl_halt_objective)
+        and kl_supervision_mode == "step_uniform"
+    )
     if uses_trm_objective:
+        rearev_trm_style_enabled = True
+        ranking_enabled = False
+        ranking_weight = 0.0
+        bce_hard_negative_enabled = False
+        pos_weight_mode = "off"
+        fixed_pos_weight = 1.0
+        max_pos_weight = 1.0
+    elif uses_kl_halt_objective:
         rearev_trm_style_enabled = True
         ranking_enabled = False
         ranking_weight = 0.0
@@ -1990,7 +2116,10 @@ def train_subgraph_reader(
         max_pos_weight = 1.0
     else:
         # Legacy KL can optionally add TRM-style deep supervision as an auxiliary term.
-        rearev_trm_style_enabled = bool(uses_kl_deep_supervision)
+        rearev_trm_style_enabled = bool(uses_kl_deep_supervision or uses_kl_step_uniform)
+    if uses_kl_step_uniform or uses_kl_halt_objective:
+        # Step-wise KL needs per-step logits; force full stage supervision rows.
+        rearev_trm_supervise_all_stages = True
     if uses_kl_objective:
         # Keep training behavior aligned with ReaRev objective.
         pos_weight_mode = "off"
@@ -2189,6 +2318,7 @@ def train_subgraph_reader(
             f"deep_sup_ce_w={deep_supervision_ce_weight:.3f} "
             f"deep_sup_halt_w={deep_supervision_halt_weight:.3f} "
             f"kl_no_pos={kl_no_positive_mode} "
+            f"kl_sup={kl_supervision_mode} "
             f"ddp_find_unused={ddp_find_unused} "
             f"early_stop={early_stop_enabled} "
             f"early_stop_metric={early_stop_metric} "
@@ -2241,11 +2371,19 @@ def train_subgraph_reader(
                 q_emb=batch_dev["q_emb"],
                 return_aux=(
                     uses_trm_objective
+                    or uses_kl_halt_objective
                     or uses_kl_trm_objective
                     or uses_kl_deep_supervision
+                    or uses_kl_step_uniform
                 ),
             )
-            if uses_trm_objective or uses_kl_trm_objective or uses_kl_deep_supervision:
+            if (
+                uses_trm_objective
+                or uses_kl_halt_objective
+                or uses_kl_trm_objective
+                or uses_kl_deep_supervision
+                or uses_kl_step_uniform
+            ):
                 logits = model_out["logits"]
                 step_logits = model_out["step_logits"]
                 step_halt_logits = model_out["step_halt_logits"]
@@ -2277,6 +2415,29 @@ def train_subgraph_reader(
                     + float(rearev_trm_halt_bce_weight) * halt_loss
                 )
                 step_pos_weight = 1.0
+            elif uses_kl_halt_objective:
+                if uses_kl_step_uniform:
+                    kl_component, kl_aux = _masked_rearev_step_kl_loss(
+                        step_logits=step_logits,
+                        targets=batch_dev["node_labels"],
+                        mask=batch_dev["node_mask"],
+                        step_valid_mask=step_valid_mask,
+                        no_positive_mode=kl_no_positive_mode,
+                    )
+                else:
+                    kl_component, kl_aux = _masked_rearev_kl_loss(
+                        logits=logits,
+                        targets=batch_dev["node_labels"],
+                        mask=batch_dev["node_mask"],
+                        no_positive_mode=kl_no_positive_mode,
+                    )
+                halt_loss, halt_aux = _trm_halt_bce_loss(
+                    step_halt_logits=step_halt_logits,
+                    step_valid_mask=step_valid_mask,
+                )
+                obj_loss = kl_component + float(rearev_trm_halt_bce_weight) * halt_loss
+                obj_aux = int(kl_aux)
+                step_pos_weight = 1.0
             elif uses_kl_trm_objective:
                 kl_component, kl_aux = _masked_rearev_kl_loss(
                     logits=logits,
@@ -2304,12 +2465,21 @@ def train_subgraph_reader(
                 halt_aux += int(trm_aux)
                 step_pos_weight = 1.0
             elif uses_kl_objective:
-                obj_loss, obj_aux = _masked_rearev_kl_loss(
-                    logits=logits,
-                    targets=batch_dev["node_labels"],
-                    mask=batch_dev["node_mask"],
-                    no_positive_mode=kl_no_positive_mode,
-                )
+                if uses_kl_step_uniform:
+                    obj_loss, obj_aux = _masked_rearev_step_kl_loss(
+                        step_logits=step_logits,
+                        targets=batch_dev["node_labels"],
+                        mask=batch_dev["node_mask"],
+                        step_valid_mask=step_valid_mask,
+                        no_positive_mode=kl_no_positive_mode,
+                    )
+                else:
+                    obj_loss, obj_aux = _masked_rearev_kl_loss(
+                        logits=logits,
+                        targets=batch_dev["node_labels"],
+                        mask=batch_dev["node_mask"],
+                        no_positive_mode=kl_no_positive_mode,
+                    )
                 kl_component = obj_loss
                 if uses_kl_deep_supervision:
                     trm_ce_component, trm_aux = _masked_trm_step_ce_loss(
@@ -2409,6 +2579,12 @@ def train_subgraph_reader(
                         f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
                         f"grad={grad_norm_val:.2e}"
                     )
+                elif uses_kl_halt_objective:
+                    pbar.set_postfix_str(
+                        f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                        f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                        f"grad={grad_norm_val:.2e}"
+                    )
                 elif uses_kl_trm_objective:
                     pbar.set_postfix_str(
                         f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
@@ -2448,6 +2624,12 @@ def train_subgraph_reader(
                         step_log["train/step_trm_halt_loss"] = float(halt_loss.item())
                         step_log["train/step_trm_halt_valid_steps"] = int(halt_aux)
                         step_log["train/step_trm_ce_valid_rows"] = int(obj_aux)
+                    elif uses_kl_halt_objective:
+                        step_log["train/step_kl_halt_loss"] = float(obj_loss.item())
+                        step_log["train/step_kl_component"] = float(kl_component.item())
+                        step_log["train/step_halt_component"] = float(halt_loss.item())
+                        step_log["train/step_kl_valid_rows"] = int(obj_aux)
+                        step_log["train/step_halt_valid_steps"] = int(halt_aux)
                     elif uses_kl_trm_objective:
                         step_log["train/step_kl_trm_loss"] = float(obj_loss.item())
                         step_log["train/step_kl_component"] = float(kl_component.item())
@@ -2588,6 +2770,7 @@ def train_subgraph_reader(
                     "deep_supervision_ce_weight": float(deep_supervision_ce_weight),
                     "deep_supervision_halt_weight": float(deep_supervision_halt_weight),
                     "kl_no_positive_mode": str(kl_no_positive_mode),
+                    "kl_supervision_mode": str(kl_supervision_mode),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
@@ -2599,6 +2782,13 @@ def train_subgraph_reader(
                     f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
                     f"trm_ce_halt={mean_obj:.4f} halt={mean_halt:.4f} "
                     f"trm_ce_rows/step={mean_obj_aux:.1f} halt_steps/step={mean_halt_aux:.1f} "
+                    f"opt_steps={optimizer_steps}"
+                )
+            elif uses_kl_halt_objective:
+                print(
+                    f"[Train-Subgraph] ep={ep} loss={mean_loss:.4f} "
+                    f"kl+halt={mean_obj:.4f} halt={mean_halt:.4f} "
+                    f"kl_rows/step={mean_obj_aux:.1f} halt_steps/step={mean_halt_aux:.1f} "
                     f"opt_steps={optimizer_steps}"
                 )
             elif uses_kl_trm_objective:
@@ -2642,6 +2832,11 @@ def train_subgraph_reader(
                     epoch_log["train/epoch_avg_trm_halt_loss"] = float(mean_halt)
                     epoch_log["train/epoch_avg_trm_ce_valid_rows"] = float(mean_obj_aux)
                     epoch_log["train/epoch_avg_trm_halt_valid_steps"] = float(mean_halt_aux)
+                elif uses_kl_halt_objective:
+                    epoch_log["train/epoch_avg_kl_halt_loss"] = float(mean_obj)
+                    epoch_log["train/epoch_avg_halt_loss"] = float(mean_halt)
+                    epoch_log["train/epoch_avg_kl_valid_rows"] = float(mean_obj_aux)
+                    epoch_log["train/epoch_avg_halt_valid_steps"] = float(mean_halt_aux)
                 elif uses_kl_trm_objective:
                     epoch_log["train/epoch_avg_kl_trm_loss"] = float(mean_obj)
                     epoch_log["train/epoch_avg_trm_halt_loss"] = float(mean_halt)

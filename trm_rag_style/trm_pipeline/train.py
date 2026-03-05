@@ -159,6 +159,7 @@ def run(cfg):
         subgraph_pred_threshold=float(cfg.get('subgraph_pred_threshold', 0.5)),
         subgraph_loss_mode=str(cfg.get('subgraph_loss_mode', 'rearev_kl')),
         subgraph_kl_no_positive_mode=str(cfg.get('subgraph_kl_no_positive_mode', 'uniform')),
+        subgraph_kl_supervision_mode=str(cfg.get('subgraph_kl_supervision_mode', 'final')),
         subgraph_pos_weight_mode=str(cfg.get('subgraph_pos_weight_mode', 'auto')),
         subgraph_pos_weight=float(cfg.get('subgraph_pos_weight', 1.0)),
         subgraph_pos_weight_max=float(cfg.get('subgraph_pos_weight_max', 256.0)),
