@@ -1,156 +1,118 @@
-# KGQA Recursive ReaRev (Phase1 Asymmetric y/z)
+# KGQA Recursive ReaRev (D 2-Phase + Asymmetric y/z)
 
-This repository is documented around a single training path:
+This repo now supports two runnable experiment tracks:
 
-- `Phase1-only`
-- `asymmetric y/z` recursion enabled
-- loss = `KL + Halt BCE`
-- no phase2 ranking/BCE-hardneg in this default path
+- Track A: **D baseline (2-phase)**
+- Track B: **Asymmetric y/z (phase1-only, KL+Halt)**
 
-Primary launcher:
+You can run each track separately, or run both sequentially.
 
-- `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
+## 1) Main Scripts
 
----
+- D baseline (2-phase):
+  - `trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh`
+- Asymmetric y/z phase1-only:
+  - `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
+- Dual launcher (baseline/asym/both):
+  - `trm_rag_style/scripts/run_rearev_d_dual_tracks.sh`
 
-## 1) Scope
+## 2) Quick Start
 
-This README focuses on the isolated asymmetric latent reasoning module training.
+### A) D baseline only (2-phase)
 
-- model core: `trm_unified/subgraph_reader.py`
-- train entry: `trm_unified/train_core.py`
-- pipeline wrapper: `trm_rag_style/trm_pipeline/train.py`
-- phase1-only script: `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=d_baseline_v1 \
+WANDB_MODE=online WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1 FALLBACK_NPROC=2 \
+PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
+MASTER_PORT=29781 FALLBACK_MASTER_PORT=29782 PHASE2_MASTER_PORT=29791 \
+bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
+```
 
----
+### B) Asymmetric y/z only (phase1-only)
 
-## 2) Model Structure (Asymmetric y/z)
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=asym_phase1_v1 \
+WANDB_MODE=online WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1 FALLBACK_NPROC=2 \
+MASTER_PORT=29801 FALLBACK_MASTER_PORT=29802 \
+bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
+```
 
-For one sample, with:
+### C) Both tracks sequentially (baseline -> asym)
+
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=dual_v1 \
+MODE=both \
+WANDB_MODE=online WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1 FALLBACK_NPROC=2 \
+bash trm_rag_style/scripts/run_rearev_d_dual_tracks.sh
+```
+
+Run only one mode through dual launcher:
+
+- `MODE=baseline`
+- `MODE=asym`
+- `MODE=both`
+
+## 3) Training Behavior by Track
+
+### Track A: D baseline (2-phase)
+
+- Phase1 objective: `rearev_kl` (coarse)
+- Phase2 objective: `bce + ranking + hard negatives` (fine)
+- Script: `run_rearev_d_two_phase_auto.sh`
+
+### Track B: Asymmetric y/z (phase1-only)
+
+- Objective: `rearev_kl_halt`
+- KL supervision: `step_uniform`
+- Asymmetric update: `subgraph_rearev_asymmetric_yz_enabled=true`
+- No phase2 ranking/BCE-hardneg in default path
+- Script: `run_rearev_d_phase1_asym_only.sh`
+
+## 4) Asymmetric y/z Module Summary
+
+For one sample with:
 
 - `A = adapt_stages`
 - `R = recursion_steps`
 - `I = num_instructions`
 
-### Input
+Flow:
 
-- `x_node`: node embeddings
-- `x_rel`: relation/edge embeddings
-- `x_q`: question embedding
+1. Project inputs (`x_node`, `x_rel`, `x_q`) -> (`h0`, `rel`, `q`).
+2. Initialize latent `z0` and seed-based answer state `y0`.
+3. For each stage:
+   - run inner ReaRev recursion `R` times (relation-aware forward/inverse message passing)
+   - update `h`, `z`
+   - update `y` once at stage end (asymmetric)
+4. Compute loss: `L_total = L_KL + w_halt * L_halt`
+5. Single backward per mini-batch: `L_total.backward()`
 
-### Projection
-
-- `h0 = node_proj(x_node)`
-- `rel = rel_proj(x_rel)`
-- `q = q_proj(x_q)`
-
-### State Variables
-
-- `h`: node hidden state
-- `z`: global latent recurrent state
-- `y`: node-logit answer state
-
-### Asymmetric Loop
-
-1. Initialize `z0` and seed-based `y0`.
-2. For each outer stage `s in [1..A]`:
-   - Inner recursion (`t in [1..R]`):
-     - relation-aware message passing (forward/inverse) with `I` instructions
-     - update `h` and `z`
-     - keep `y` fixed during inner loop
-   - Stage end: update `y` once from `(y_prev, z_updated, h)`.
-3. Collect supervised outputs per stage (`step_logits`, `step_halt_logits`).
-
-### Operation Counts Per Sample
+Operation counts per sample:
 
 - message-passing pair calls: `A * R * I`
-- latent (`z`) updates: `A * R`
-- answer (`y`) updates in asymmetric mode: `A`
+- `z` updates: `A * R`
+- `y` updates (asymmetric): `A`
 
----
+## 5) Sanity Checks
 
-## 3) Loss Design (Current Default)
-
-Default mode:
-
-- `subgraph_loss_mode = rearev_kl_halt`
-- `subgraph_kl_supervision_mode = step_uniform`
-
-Total objective:
-
-- `L_total = L_KL + w_halt * L_halt`
-
-Where:
-
-- `L_KL`: stage-wise KL supervision (uniform over supervised stages)
-- `L_halt`: stage-wise halt BCE supervision
-- `w_halt`: `subgraph_rearev_trm_halt_bce_weight`
-
-Backward behavior:
-
-- build one scalar `L_total`
-- call `.backward()` once per mini-batch
-- optimizer step follows `grad_accum_steps`
-
----
-
-## 4) Default Training Configuration
-
-The phase1-only launcher defaults to:
-
-- `subgraph_rearev_asymmetric_yz_enabled=true`
-- `subgraph_loss_mode=rearev_kl_halt`
-- `subgraph_kl_no_positive_mode=skip`
-- `subgraph_kl_supervision_mode=step_uniform`
-- `subgraph_rearev_trm_style_enabled=true`
-- `subgraph_rearev_trm_supervise_all_stages=true`
-- `subgraph_ranking_enabled=false`
-- `subgraph_bce_hard_negative_enabled=false`
-
-Common structural defaults:
-
-- `subgraph_rearev_adapt_stages=2`
-- `subgraph_recursion_steps=4`
-- `subgraph_rearev_num_ins=3`
-
----
-
-## 5) How To Run (Phase1-only)
-
-```bash
-cd /data2/workspace/heewon/KGQA
-RUN_TAG=phase1_asym_only_v1 \
-WANDB_MODE=online \
-WANDB_PROJECT=graph-traverse \
-PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
-FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
-MASTER_PORT=29901 FALLBACK_MASTER_PORT=29902 \
-bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
-```
-
-Sanity check in startup log (`[SubgraphReader]` line):
+On startup `[SubgraphReader]` line for asym track, verify:
 
 - `loss_mode=rearev_kl_halt`
 - `rearev_asym_yz=True`
 - `kl_sup=step_uniform`
 
----
+For D baseline phase2, verify script log includes phase2 launch and `subgraph_loss_mode=bce`.
 
-## 6) Useful Overrides
-
-You can override at launch time, for example:
-
-```bash
-SUBGRAPH_REAREV_ADAPT_STAGES=3 \
-SUBGRAPH_RECURSION_STEPS=5 \
-SUBGRAPH_REAREV_TRM_HALT_BCE_WEIGHT=1.2 \
-SUBGRAPH_GRAD_ACCUM_STEPS=8 \
-bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
-```
-
----
-
-## 7) Path Trace During Test
+## 6) Test Path Trace
 
 ```bash
 cd /data2/workspace/heewon/KGQA
@@ -171,10 +133,3 @@ python -m trm_agent.run \
     subgraph_trace_dump_max_examples=1000 \
     subgraph_trace_path_dump_jsonl=logs/trace/test_paths.jsonl
 ```
-
----
-
-## 8) Notes
-
-- This README intentionally does not describe D+ or two-phase recipes.
-- If you still use legacy scripts, treat this README as the reference for the current asymmetric phase1 path.
