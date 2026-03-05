@@ -1,253 +1,156 @@
-# KGQA Recursive ReaRev (D / D+latent)
+# KGQA Recursive ReaRev (Phase1 Asymmetric y/z)
 
-This repository is configured for the **subgraph-reader ReaRev path only**.
+This repository is documented around a single training path:
 
+- `Phase1-only`
+- `asymmetric y/z` recursion enabled
+- loss = `KL + Halt BCE`
+- no phase2 ranking/BCE-hardneg in this default path
 
-- Subgraph variant is fixed to `rearev_bfs`.
-- Core training target is the D pipeline:
-  - Phase 1: ReaRev KL objective (optional deep supervision)
-  - Phase 2: BCE + ranking + hard negatives
+Primary launcher:
 
-## 1) Repo Layout
+- `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
 
-- `trm_unified/subgraph_reader.py`: recursive ReaRev model + losses
-- `trm_unified/train_core.py`: train/test entry; subgraph-only guard
-- `trm_rag_style/scripts/`: runnable scripts for D phase1/phase2
-- `trm_agent/`: processed data, embeddings, checkpoints
+---
 
-## 2) Recursive ReaRev Core
+## 1) Scope
 
-`RecursiveSubgraphReader` runs recurrent graph reasoning over each subgraph.
-Main state variables are:
+This README focuses on the isolated asymmetric latent reasoning module training.
 
-- `h_t`: node hidden states
-- `p_t`: node distribution (`softmax` over node logits)
-- `z_t`: latent reasoning state (when latent enabled)
+- model core: `trm_unified/subgraph_reader.py`
+- train entry: `trm_unified/train_core.py`
+- pipeline wrapper: `trm_rag_style/trm_pipeline/train.py`
+- phase1-only script: `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
 
-Per recursion step, the model does:
+---
 
-1. Build step instruction vectors (optionally modulated by `z_t`).
-2. Run relation-aware forward/inverse message passing on edges.
-3. Update node states (`h_t -> h_{t+1}`), optionally with global gate:
-   - gate uses `[h_t ; z_t]` to suppress noisy node updates.
-4. Score nodes, optionally with global-local logit fusion:
-   - node score uses both local node state and global latent context.
-5. Convert scores to distribution `p_{t+1}`.
-6. Update latent state with GRU:
-   - `z_{t+1} = GRU(context_from(h_{t+1}, p_{t+1}), z_t)`.
-7. Optional dynamic halting accumulates stop probability from latent state.
+## 2) Model Structure (Asymmetric y/z)
 
-Key knobs:
+For one sample, with:
 
-- `subgraph_recursion_steps`
-- `subgraph_rearev_num_ins`
-- `subgraph_rearev_adapt_stages`
-- `subgraph_rearev_latent_reasoning_enabled`
-- `subgraph_rearev_global_gate_enabled`
-- `subgraph_rearev_logit_global_fusion_enabled`
-- `subgraph_rearev_dynamic_halting_enabled`
+- `A = adapt_stages`
+- `R = recursion_steps`
+- `I = num_instructions`
 
-### Asymmetric Continuous Latent Recursion (`x,y,z`)
+### Input
 
-For the requested TRM-style asymmetric loop, enable:
+- `x_node`: node embeddings
+- `x_rel`: relation/edge embeddings
+- `x_q`: question embedding
+
+### Projection
+
+- `h0 = node_proj(x_node)`
+- `rel = rel_proj(x_rel)`
+- `q = q_proj(x_q)`
+
+### State Variables
+
+- `h`: node hidden state
+- `z`: global latent recurrent state
+- `y`: node-logit answer state
+
+### Asymmetric Loop
+
+1. Initialize `z0` and seed-based `y0`.
+2. For each outer stage `s in [1..A]`:
+   - Inner recursion (`t in [1..R]`):
+     - relation-aware message passing (forward/inverse) with `I` instructions
+     - update `h` and `z`
+     - keep `y` fixed during inner loop
+   - Stage end: update `y` once from `(y_prev, z_updated, h)`.
+3. Collect supervised outputs per stage (`step_logits`, `step_halt_logits`).
+
+### Operation Counts Per Sample
+
+- message-passing pair calls: `A * R * I`
+- latent (`z`) updates: `A * R`
+- answer (`y`) updates in asymmetric mode: `A`
+
+---
+
+## 3) Loss Design (Current Default)
+
+Default mode:
+
+- `subgraph_loss_mode = rearev_kl_halt`
+- `subgraph_kl_supervision_mode = step_uniform`
+
+Total objective:
+
+- `L_total = L_KL + w_halt * L_halt`
+
+Where:
+
+- `L_KL`: stage-wise KL supervision (uniform over supervised stages)
+- `L_halt`: stage-wise halt BCE supervision
+- `w_halt`: `subgraph_rearev_trm_halt_bce_weight`
+
+Backward behavior:
+
+- build one scalar `L_total`
+- call `.backward()` once per mini-batch
+- optimizer step follows `grad_accum_steps`
+
+---
+
+## 4) Default Training Configuration
+
+The phase1-only launcher defaults to:
 
 - `subgraph_rearev_asymmetric_yz_enabled=true`
-
-Then one outer stage works as:
-
-1. Keep current answer state `y` fixed.
-2. Run inner ReaRev recursion multiple times to refine latent/memory state `z`:
-   - inner updates still use ReaRev relation-aware message passing.
-   - latent state is recurrently updated from graph context.
-3. After inner refinement finishes, update `y` **once** from `(y_prev, z_updated)`.
-
-Mapping to your notation:
-
-- `x`: question-conditioned instruction anchor (fixed problem context)
-- `y`: node-logit/distribution answer state
-- `z`: latent recurrent reasoning state
-
-So ReaRev remains the inner graph reasoner, and only the outer update schedule is asymmetric.
-
-## 3) Loss Design (D Pipeline)
-
-### Phase 1 (from scratch): `subgraph_loss_mode=rearev_kl`
-
-Base objective:
-
-- `L = KL(target_node_distribution || predicted_node_distribution)`
-
-Important stability option:
-
+- `subgraph_loss_mode=rearev_kl_halt`
 - `subgraph_kl_no_positive_mode=skip`
-  - if no positive node exists in the current row/subgraph, KL for that row is skipped
-  - avoids uniform-target over-regularization on no-positive rows
 - `subgraph_kl_supervision_mode=step_uniform`
-  - apply ReaRev KL at every supervised step (uniform average), not only final logits
+- `subgraph_rearev_trm_style_enabled=true`
+- `subgraph_rearev_trm_supervise_all_stages=true`
+- `subgraph_ranking_enabled=false`
+- `subgraph_bce_hard_negative_enabled=false`
 
-Optional deep supervision (this repo addition):
+Common structural defaults:
 
-- `L = KL + lambda_ds * (w_ce * L_step_ce + w_halt * L_halt)`
+- `subgraph_rearev_adapt_stages=2`
+- `subgraph_recursion_steps=4`
+- `subgraph_rearev_num_ins=3`
 
-where:
+---
 
-- `L_step_ce`: CE over step-level node logits
-- `L_halt`: BCE over step-level halt logits
-- `lambda_ds`: `subgraph_deep_supervision_weight`
-
-Note: this is not a separate "latent-only loss". It is an auxiliary supervision term
-that also updates latent-related parameters through the recurrent path.
-
-### Phase 2 (resume): `subgraph_loss_mode=bce`
-
-- `L = BCE_hardneg + ranking_weight * L_rank`
-
-with:
-
-- auto/fixed pos-weight options
-- hard negative node filtering
-- ranking margin loss over hard negatives
-
-## 4) Environment
+## 5) How To Run (Phase1-only)
 
 ```bash
 cd /data2/workspace/heewon/KGQA
-pip install -r requirements.txt
-```
-
-## 5) Data and Embeddings
-
-```bash
-bash trm_rag_style/scripts/run_download.sh
-```
-
-```bash
-DATASET=cwq \
-EMB_MODEL=intfloat/multilingual-e5-large \
-EMB_TAG=e5_w4_g4 \
-EMBED_GPUS=0,1,2,3 \
-EMBED_BATCH_SIZE=512 \
-bash trm_rag_style/scripts/run_embed.sh
-```
-
-## 6) Train / Test Entry
-
-Phase 1 (auto fallback 4->2 GPU on OOM):
-
-```bash
-bash trm_rag_style/scripts/run_rearev_d_auto_fallback_4to2.sh
-```
-
-Phase 2 (resume from selected phase1 checkpoint):
-
-```bash
-bash trm_rag_style/scripts/run_rearev_d_phase2_resume.sh
-```
-
-Two-phase automation:
-
-```bash
-bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
-```
-
-Phase 1 only (asymmetric `y/z` + `KL/Halt` only):
-
-```bash
+RUN_TAG=phase1_asym_only_v1 \
+WANDB_MODE=online \
+WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
+MASTER_PORT=29901 FALLBACK_MASTER_PORT=29902 \
 bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
 ```
 
-Test:
+Sanity check in startup log (`[SubgraphReader]` line):
+
+- `loss_mode=rearev_kl_halt`
+- `rearev_asym_yz=True`
+- `kl_sup=step_uniform`
+
+---
+
+## 6) Useful Overrides
+
+You can override at launch time, for example:
 
 ```bash
-bash trm_rag_style/scripts/run_test.sh
+SUBGRAPH_REAREV_ADAPT_STAGES=3 \
+SUBGRAPH_RECURSION_STEPS=5 \
+SUBGRAPH_REAREV_TRM_HALT_BCE_WEIGHT=1.2 \
+SUBGRAPH_GRAD_ACCUM_STEPS=8 \
+bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
 ```
 
-## 7) Deep Supervision Knobs (Phase 1)
+---
 
-- `SUBGRAPH_DEEP_SUPERVISION_ENABLED=true|false`
-- `SUBGRAPH_DEEP_SUPERVISION_WEIGHT` (recommended start: `0.03~0.10`)
-- `SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT` (default `1.0`)
-- `SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT` (default `0.3~1.0`)
-- `SUBGRAPH_REAREV_TRM_TMINUS1_NO_GRAD` (`false` for full-step gradient)
-- `SUBGRAPH_REAREV_TRM_DETACH_CARRY` (`false` for full-step gradient)
-
-## 8) Quick Recipes (D / D+latent)
-
-### A) D Baseline (two-phase auto)
-
-```bash
-cd /data2/workspace/heewon/KGQA
-RUN_TAG=d_baseline_4gpu \
-WANDB_MODE=online \
-WANDB_PROJECT=graph-traverse \
-PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
-FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
-PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
-MASTER_PORT=29781 PHASE2_MASTER_PORT=29791 \
-EPOCHS=16 PHASE2_EPOCHS=5 \
-bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
-```
-
-### B) D+latent (KL + deep supervision in phase1)
-
-```bash
-cd /data2/workspace/heewon/KGQA
-RUN_TAG=d_latent_ds_4gpu \
-WANDB_MODE=online \
-WANDB_PROJECT=graph-traverse \
-PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
-FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
-PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
-MASTER_PORT=29811 PHASE2_MASTER_PORT=29821 \
-EPOCHS=16 PHASE2_EPOCHS=5 \
-PHASE1_SUBGRAPH_LOSS_MODE=rearev_kl \
-PHASE1_SUBGRAPH_DEEP_SUPERVISION_ENABLED=true \
-PHASE1_SUBGRAPH_DEEP_SUPERVISION_WEIGHT=0.03 \
-PHASE1_SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT=1.0 \
-PHASE1_SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT=0.3 \
-PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
-PHASE1_SUBGRAPH_KL_SUPERVISION_MODE=step_uniform \
-PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
-PHASE1_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA=0.25 \
-bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
-```
-
-### B-2) D+latent Asymmetric `y/z` (ReaRev inner, outer asymmetric update)
-
-```bash
-cd /data2/workspace/heewon/KGQA
-RUN_TAG=d_latent_asymyz_4gpu \
-WANDB_MODE=online \
-WANDB_PROJECT=graph-traverse \
-PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
-FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
-PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
-MASTER_PORT=29831 PHASE2_MASTER_PORT=29841 \
-EPOCHS=16 PHASE2_EPOCHS=5 \
-PHASE1_SUBGRAPH_LOSS_MODE=rearev_kl \
-PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
-PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
-PHASE1_SUBGRAPH_REAREV_ASYMMETRIC_YZ_ENABLED=true \
-PHASE1_SUBGRAPH_REAREV_ACT_STOP_IN_TRAIN=true \
-PHASE1_SUBGRAPH_REAREV_TRM_SUPERVISE_ALL_STAGES=true \
-bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
-```
-
-### C) Batch=1 for both phases
-
-Use these two variables together:
-
-- `BATCH_SIZE=1`
-- `PHASE2_BATCH_SIZE=1`
-
-Optionally keep effective batch with accumulation:
-
-- `SUBGRAPH_GRAD_ACCUM_STEPS=8`
-- `PHASE2_SUBGRAPH_GRAD_ACCUM_STEPS=8`
-
-## 9) Path Trace During Test
-
-To print and dump multi-hop explicit paths:
+## 7) Path Trace During Test
 
 ```bash
 cd /data2/workspace/heewon/KGQA
@@ -269,72 +172,9 @@ python -m trm_agent.run \
     subgraph_trace_path_dump_jsonl=logs/trace/test_paths.jsonl
 ```
 
-## 10) Phase1-Only Asymmetric `y/z` Module (Isolated Training)
+---
 
-This is a dedicated training path for the asymmetric continuous latent recursion module only.
-It does **not** execute phase2.
+## 8) Notes
 
-- Script: `trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh`
-- Default objective:
-  - `subgraph_loss_mode=rearev_kl_halt`
-  - `subgraph_kl_supervision_mode=step_uniform`
-  - `subgraph_rearev_asymmetric_yz_enabled=true`
-  - `subgraph_ranking_enabled=false`
-  - `subgraph_bce_hard_negative_enabled=false`
-
-### Module Structure (Asymmetric `y/z`)
-
-For one sample, with `A=adapt_stages`, `R=recursion_steps`, `I=num_instructions`:
-
-1. Input projection
-   - `h0 = node_proj(x_node)`
-   - `q = q_proj(x_q)`
-   - `rel = rel_proj(x_rel)`
-2. Initialize latent/answer states
-   - `z0` (latent global state)
-   - `y0` (seed-based node logits/distribution)
-3. Outer stage loop (`A`)
-   - Inner recursion loop (`R`): run ReaRev message passing with `I` instructions
-     - relation-aware forward/inverse aggregation
-     - update `h` and `z`
-   - Stage-end answer update (asymmetric)
-     - update `y` once from `(y_prev, z_updated, h)`
-4. Collect supervision tensors (`step_logits`, `step_halt_logits`)
-
-Operational counts per sample:
-
-- message passing pair calls: `A * R * I`
-- `z` updates: `A * R`
-- `y` updates (asymmetric mode): `A`
-
-### Loss Applied
-
-At training step:
-
-- `L_total = L_KL + w_halt * L_halt`
-- `L_KL`: step-uniform KL over supervised stage outputs
-- `L_halt`: BCE over halt logits at supervised stage outputs
-
-Then one backward pass per mini-batch:
-
-- `L_total.backward()`
-- optimizer step follows gradient accumulation setting
-
-### Run Example (4 GPUs, phase1 only)
-
-```bash
-cd /data2/workspace/heewon/KGQA
-RUN_TAG=phase1_asym_only_v1 \
-WANDB_MODE=online \
-WANDB_PROJECT=graph-traverse \
-PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
-FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
-MASTER_PORT=29901 FALLBACK_MASTER_PORT=29902 \
-bash trm_rag_style/scripts/run_rearev_d_phase1_asym_only.sh
-```
-
-Start-line sanity check:
-
-- `loss_mode=rearev_kl_halt`
-- `rearev_asym_yz=True`
-- `kl_sup=step_uniform`
+- This README intentionally does not describe D+ or two-phase recipes.
+- If you still use legacy scripts, treat this README as the reference for the current asymmetric phase1 path.
