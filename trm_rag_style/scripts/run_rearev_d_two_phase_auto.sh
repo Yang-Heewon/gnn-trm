@@ -15,6 +15,12 @@ PHASE1_LOG_DIR="${PHASE1_LOG_DIR:-logs/rearev_d_auto_fallback_${RUN_TAG}}"
 # Phase2 (fine) directories/names
 PHASE2_CKPT_DIR="${PHASE2_CKPT_DIR:-trm_agent/ckpt/cwq_trm_hier6_rearev_D_phase2_${RUN_TAG}}"
 PHASE2_WANDB_RUN_NAME="${PHASE2_WANDB_RUN_NAME:-cwq-rearev-D-phase2-${RUN_TAG}}"
+PHASE2_LOG_DIR="${PHASE2_LOG_DIR:-logs/rearev_d_phase2_${RUN_TAG}}"
+PHASE2_LOG_FILE="${PHASE2_LOG_FILE:-${PHASE2_LOG_DIR}/phase2.log}"
+PHASE2_BEST_METRIC="${PHASE2_BEST_METRIC:-dev_hit1}" # dev_hit1 | dev_f1
+PHASE2_BEST_CKPT="${PHASE2_BEST_CKPT:-}"
+AUTO_RUN_LATENT_ABLATION="${AUTO_RUN_LATENT_ABLATION:-false}"
+ABLATION_SPLIT="${ABLATION_SPLIT:-test}"
 
 # Control flags
 RUN_PHASE1="${RUN_PHASE1:-true}"  # false => skip phase1 and use PHASE1_BEST_CKPT
@@ -38,9 +44,24 @@ if [[ "$RUN_PHASE1" == "true" ]]; then
   SUBGRAPH_GRAD_ACCUM_STEPS="${SUBGRAPH_GRAD_ACCUM_STEPS:-8}" \
   SUBGRAPH_MAX_NODES="${SUBGRAPH_MAX_NODES:-4096}" \
   SUBGRAPH_MAX_EDGES="${SUBGRAPH_MAX_EDGES:-16384}" \
+  SEED="${SEED:-42}" \
+  DETERMINISTIC="${DETERMINISTIC:-false}" \
   SUBGRAPH_REAREV_NORMALIZED_GNN="$SUBGRAPH_REAREV_NORMALIZED_GNN" \
   SUBGRAPH_LOSS_MODE="${SUBGRAPH_LOSS_MODE:-rearev_kl}" \
+  SUBGRAPH_KL_NO_POSITIVE_MODE="${PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE:-${SUBGRAPH_KL_NO_POSITIVE_MODE:-uniform}}" \
   SUBGRAPH_RANKING_ENABLED="${SUBGRAPH_RANKING_ENABLED:-false}" \
+  SUBGRAPH_EARLY_STOP_ENABLED="${PHASE1_SUBGRAPH_EARLY_STOP_ENABLED:-true}" \
+  SUBGRAPH_EARLY_STOP_METRIC="${PHASE1_SUBGRAPH_EARLY_STOP_METRIC:-dev_hit1}" \
+  SUBGRAPH_EARLY_STOP_PATIENCE="${PHASE1_SUBGRAPH_EARLY_STOP_PATIENCE:-4}" \
+  SUBGRAPH_EARLY_STOP_MIN_DELTA="${PHASE1_SUBGRAPH_EARLY_STOP_MIN_DELTA:-1e-3}" \
+  SUBGRAPH_EARLY_STOP_MIN_EPOCHS="${PHASE1_SUBGRAPH_EARLY_STOP_MIN_EPOCHS:-8}" \
+  SUBGRAPH_REAREV_LATENT_REASONING_ENABLED="${PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED:-true}" \
+  SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA="${PHASE1_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA:-0.25}" \
+  SUBGRAPH_REAREV_GLOBAL_GATE_ENABLED="${PHASE1_SUBGRAPH_REAREV_GLOBAL_GATE_ENABLED:-true}" \
+  SUBGRAPH_REAREV_LOGIT_GLOBAL_FUSION_ENABLED="${PHASE1_SUBGRAPH_REAREV_LOGIT_GLOBAL_FUSION_ENABLED:-true}" \
+  SUBGRAPH_REAREV_DYNAMIC_HALTING_ENABLED="${PHASE1_SUBGRAPH_REAREV_DYNAMIC_HALTING_ENABLED:-true}" \
+  SUBGRAPH_REAREV_DYNAMIC_HALTING_MIN_STEPS="${PHASE1_SUBGRAPH_REAREV_DYNAMIC_HALTING_MIN_STEPS:-3}" \
+  SUBGRAPH_REAREV_DYNAMIC_HALTING_THRESHOLD="${PHASE1_SUBGRAPH_REAREV_DYNAMIC_HALTING_THRESHOLD:-0.95}" \
   SUBGRAPH_DEEP_SUPERVISION_ENABLED="${PHASE1_SUBGRAPH_DEEP_SUPERVISION_ENABLED:-false}" \
   SUBGRAPH_DEEP_SUPERVISION_WEIGHT="${PHASE1_SUBGRAPH_DEEP_SUPERVISION_WEIGHT:-0.0}" \
   SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT="${PHASE1_SUBGRAPH_DEEP_SUPERVISION_CE_WEIGHT:-1.0}" \
@@ -63,8 +84,8 @@ log_dir = Path(os.environ["PHASE1_LOG_DIR"])
 log_files = [log_dir / "primary_4gpu.log", log_dir / "fallback_2gpu.log"]
 
 best = None  # (hit, ep, ckpt_path)
-dev_ep_pat = re.compile(r"Dev ep(\d+) \\[Subgraph\\]")
-dev_hit_pat = re.compile(r"\\[Dev-Subgraph\\] Hit@1=([0-9.]+)")
+dev_ep_pat = re.compile(r"Dev ep(\d+) \[Subgraph\]")
+dev_hit_pat = re.compile(r"\[Dev-Subgraph\] Hit@1=([0-9.]+)")
 
 for lf in log_files:
     if not lf.exists():
@@ -106,11 +127,14 @@ fi
 echo "[phase1] best ckpt: $PHASE1_BEST_CKPT"
 
 echo "[phase2] start fine-tuning from phase1 best"
+mkdir -p "$PHASE2_LOG_DIR"
 CUDA_VISIBLE_DEVICES="${PHASE2_GPUS:-0,1}" \
 NPROC_PER_NODE="${PHASE2_NPROC_PER_NODE:-2}" \
 MASTER_PORT="${PHASE2_MASTER_PORT:-29679}" \
 CKPT="$PHASE1_BEST_CKPT" \
 CKPT_DIR="$PHASE2_CKPT_DIR" \
+SEED="${SEED:-42}" \
+DETERMINISTIC="${DETERMINISTIC:-false}" \
 WANDB_MODE="${WANDB_MODE:-online}" \
 WANDB_PROJECT="${WANDB_PROJECT:-graph-traverse}" \
 WANDB_RUN_NAME="$PHASE2_WANDB_RUN_NAME" \
@@ -118,7 +142,100 @@ EPOCHS="${PHASE2_EPOCHS:-5}" \
 LR="${PHASE2_LR:-5e-5}" \
 BATCH_SIZE="${PHASE2_BATCH_SIZE:-2}" \
 SUBGRAPH_GRAD_ACCUM_STEPS="${PHASE2_SUBGRAPH_GRAD_ACCUM_STEPS:-4}" \
+SUBGRAPH_MAX_NODES="${PHASE2_SUBGRAPH_MAX_NODES:-${SUBGRAPH_MAX_NODES:-4096}}" \
+SUBGRAPH_MAX_EDGES="${PHASE2_SUBGRAPH_MAX_EDGES:-${SUBGRAPH_MAX_EDGES:-16384}}" \
+SUBGRAPH_RANKING_WEIGHT="${PHASE2_SUBGRAPH_RANKING_WEIGHT:-0.15}" \
+SUBGRAPH_RANKING_MARGIN="${PHASE2_SUBGRAPH_RANKING_MARGIN:-0.2}" \
+SUBGRAPH_HARD_NEGATIVE_TOPK="${PHASE2_SUBGRAPH_HARD_NEGATIVE_TOPK:-32}" \
+SUBGRAPH_BCE_HARD_NEGATIVE_TOPK="${PHASE2_SUBGRAPH_BCE_HARD_NEGATIVE_TOPK:-64}" \
+SUBGRAPH_POS_WEIGHT_MAX="${PHASE2_SUBGRAPH_POS_WEIGHT_MAX:-256}" \
 SUBGRAPH_REAREV_NORMALIZED_GNN="$SUBGRAPH_REAREV_NORMALIZED_GNN" \
-bash trm_rag_style/scripts/run_rearev_d_phase2_resume.sh
+SUBGRAPH_REAREV_LATENT_REASONING_ENABLED="${PHASE2_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED:-true}" \
+SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA="${PHASE2_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA:-0.25}" \
+SUBGRAPH_REAREV_GLOBAL_GATE_ENABLED="${PHASE2_SUBGRAPH_REAREV_GLOBAL_GATE_ENABLED:-true}" \
+SUBGRAPH_REAREV_LOGIT_GLOBAL_FUSION_ENABLED="${PHASE2_SUBGRAPH_REAREV_LOGIT_GLOBAL_FUSION_ENABLED:-true}" \
+SUBGRAPH_REAREV_DYNAMIC_HALTING_ENABLED="${PHASE2_SUBGRAPH_REAREV_DYNAMIC_HALTING_ENABLED:-true}" \
+SUBGRAPH_REAREV_DYNAMIC_HALTING_MIN_STEPS="${PHASE2_SUBGRAPH_REAREV_DYNAMIC_HALTING_MIN_STEPS:-3}" \
+SUBGRAPH_REAREV_DYNAMIC_HALTING_THRESHOLD="${PHASE2_SUBGRAPH_REAREV_DYNAMIC_HALTING_THRESHOLD:-0.95}" \
+bash trm_rag_style/scripts/run_rearev_d_phase2_resume.sh 2>&1 | tee "$PHASE2_LOG_FILE"
+
+if [[ -z "$PHASE2_BEST_CKPT" ]]; then
+  echo "[phase2] select best ckpt by ${PHASE2_BEST_METRIC}"
+  PHASE2_BEST_CKPT="$(
+    PHASE2_CKPT_DIR="$PHASE2_CKPT_DIR" PHASE2_LOG_FILE="$PHASE2_LOG_FILE" PHASE2_BEST_METRIC="$PHASE2_BEST_METRIC" \
+    /data2/workspace/heewon/anaconda3/envs/taiLab/bin/python - <<'PY'
+import os
+import re
+from pathlib import Path
+
+ckpt_dir = Path(os.environ["PHASE2_CKPT_DIR"])
+log_file = Path(os.environ["PHASE2_LOG_FILE"])
+metric_name = str(os.environ.get("PHASE2_BEST_METRIC", "dev_hit1")).strip().lower()
+if metric_name not in {"dev_hit1", "dev_f1"}:
+    metric_name = "dev_hit1"
+
+if not log_file.exists():
+    raise SystemExit("")
+
+dev_ep_pat = re.compile(r"Dev ep(\d+) \[Subgraph\]")
+hit_pat = re.compile(r"Hit@1=([0-9.]+)")
+f1_pat = re.compile(r"F1=([0-9.]+)")
+
+best = None  # (metric, ep, ckpt_path)
+cur_ep = None
+with log_file.open("r", encoding="utf-8", errors="ignore") as f:
+    for line in f:
+        m_ep = dev_ep_pat.search(line)
+        if m_ep:
+            cur_ep = int(m_ep.group(1))
+            continue
+        if "[Dev-Subgraph]" not in line or cur_ep is None:
+            continue
+        m_hit = hit_pat.search(line)
+        m_f1 = f1_pat.search(line)
+        if m_hit is None or m_f1 is None:
+            continue
+        hit = float(m_hit.group(1))
+        f1 = float(m_f1.group(1))
+        metric = hit if metric_name == "dev_hit1" else f1
+        ckpt = ckpt_dir / f"model_ep{cur_ep}.pt"
+        if not ckpt.exists():
+            continue
+        cand = (metric, cur_ep, str(ckpt))
+        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
+            best = cand
+
+if best is None:
+    cands = sorted(
+        ckpt_dir.glob("model_ep*.pt"),
+        key=lambda p: int(re.search(r"model_ep(\d+)\.pt$", p.name).group(1))
+    )
+    if not cands:
+        raise SystemExit("")
+    print(str(cands[-1]))
+else:
+    print(best[2])
+PY
+  )"
+fi
+
+if [[ -n "$PHASE2_BEST_CKPT" && -f "$PHASE2_BEST_CKPT" ]]; then
+  echo "[phase2] best ckpt: $PHASE2_BEST_CKPT"
+  printf "%s\n" "$PHASE2_BEST_CKPT" > "${PHASE2_CKPT_DIR}/best_${PHASE2_BEST_METRIC}.txt"
+else
+  echo "[warn] could not determine phase2 best checkpoint."
+fi
+
+if [[ "$AUTO_RUN_LATENT_ABLATION" == "true" ]]; then
+  if [[ -n "$PHASE2_BEST_CKPT" && -f "$PHASE2_BEST_CKPT" ]]; then
+    echo "[phase2] run latent ablation on best checkpoint"
+    CKPT="$PHASE2_BEST_CKPT" \
+    SPLIT="$ABLATION_SPLIT" \
+    CUDA_VISIBLE_DEVICES="${PHASE2_GPUS:-0}" \
+    bash trm_rag_style/scripts/run_rearev_d_latent_ablation_eval.sh
+  else
+    echo "[warn] skip ablation: best checkpoint missing"
+  fi
+fi
 
 echo "[done] two-phase pipeline finished"
