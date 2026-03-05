@@ -125,6 +125,15 @@ def run(cfg):
         subgraph_rearev_trm_detach_carry=_as_bool(
             cfg.get('subgraph_rearev_trm_detach_carry', True)
         ),
+        subgraph_rearev_trm_supervise_all_stages=_as_bool(
+            cfg.get('subgraph_rearev_trm_supervise_all_stages', False)
+        ),
+        subgraph_rearev_act_stop_in_train=_as_bool(
+            cfg.get('subgraph_rearev_act_stop_in_train', False)
+        ),
+        subgraph_rearev_asymmetric_yz_enabled=_as_bool(
+            cfg.get('subgraph_rearev_asymmetric_yz_enabled', False)
+        ),
         subgraph_rearev_trm_halt_bce_weight=float(
             cfg.get('subgraph_rearev_trm_halt_bce_weight', 1.0)
         ),
@@ -149,6 +158,7 @@ def run(cfg):
         subgraph_dropout=float(cfg.get('subgraph_dropout', 0.1)),
         subgraph_pred_threshold=float(cfg.get('subgraph_pred_threshold', 0.5)),
         subgraph_loss_mode=str(cfg.get('subgraph_loss_mode', 'rearev_kl')),
+        subgraph_kl_no_positive_mode=str(cfg.get('subgraph_kl_no_positive_mode', 'uniform')),
         subgraph_pos_weight_mode=str(cfg.get('subgraph_pos_weight_mode', 'auto')),
         subgraph_pos_weight=float(cfg.get('subgraph_pos_weight', 1.0)),
         subgraph_pos_weight_max=float(cfg.get('subgraph_pos_weight_max', 256.0)),
@@ -171,6 +181,11 @@ def run(cfg):
         subgraph_lr_plateau_patience=int(cfg.get('subgraph_lr_plateau_patience', 2)),
         subgraph_lr_plateau_threshold=float(cfg.get('subgraph_lr_plateau_threshold', 1e-4)),
         subgraph_lr_plateau_metric=str(cfg.get('subgraph_lr_plateau_metric', 'train_loss')),
+        subgraph_early_stop_enabled=_as_bool(cfg.get('subgraph_early_stop_enabled', False)),
+        subgraph_early_stop_metric=str(cfg.get('subgraph_early_stop_metric', 'dev_hit1')),
+        subgraph_early_stop_patience=int(cfg.get('subgraph_early_stop_patience', 0)),
+        subgraph_early_stop_min_delta=float(cfg.get('subgraph_early_stop_min_delta', 1e-4)),
+        subgraph_early_stop_min_epochs=int(cfg.get('subgraph_early_stop_min_epochs', 1)),
         subgraph_resume_epoch=int(cfg.get('subgraph_resume_epoch', -1)),
         train_min_path_hops=int(cfg.get('train_min_path_hops', 1)),
         freeze_lm_head=_as_bool(cfg.get('freeze_lm_head', True)),

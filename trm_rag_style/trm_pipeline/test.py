@@ -77,6 +77,33 @@ def run(cfg):
         subgraph_rearev_dynamic_halting_min_steps=int(
             cfg.get('subgraph_rearev_dynamic_halting_min_steps', 1)
         ),
+        subgraph_rearev_trm_supervise_all_stages=_as_bool(
+            cfg.get('subgraph_rearev_trm_supervise_all_stages', False)
+        ),
+        subgraph_rearev_act_stop_in_train=_as_bool(
+            cfg.get('subgraph_rearev_act_stop_in_train', False)
+        ),
+        subgraph_rearev_asymmetric_yz_enabled=_as_bool(
+            cfg.get('subgraph_rearev_asymmetric_yz_enabled', False)
+        ),
+        subgraph_trace_relation_topk_enabled=_as_bool(
+            cfg.get('subgraph_trace_relation_topk_enabled', False)
+        ),
+        subgraph_trace_relation_topk=int(
+            cfg.get('subgraph_trace_relation_topk', 5)
+        ),
+        subgraph_trace_log_examples=int(
+            cfg.get('subgraph_trace_log_examples', 5)
+        ),
+        subgraph_trace_dump_max_examples=int(
+            cfg.get('subgraph_trace_dump_max_examples', 1000)
+        ),
+        subgraph_trace_max_examples=int(
+            cfg.get('subgraph_trace_max_examples', 3)
+        ),
+        subgraph_trace_path_dump_jsonl=str(
+            cfg.get('subgraph_trace_path_dump_jsonl', '')
+        ),
         subgraph_dropout=float(cfg.get('subgraph_dropout', 0.1)),
         subgraph_pred_threshold=float(cfg.get('subgraph_pred_threshold', 0.5)),
         eval_dump_jsonl=str(cfg.get('eval_dump_jsonl', '')),

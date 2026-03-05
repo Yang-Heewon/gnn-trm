@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -246,6 +247,7 @@ class SubgraphCollator:
         edge_src_list = []
         edge_dst_list = []
         edge_rel_emb_list = []
+        edge_rel_id_list = []
         edge_dir_list = []
         edge_mask_list = []
         q_emb_list = []
@@ -315,6 +317,7 @@ class SubgraphCollator:
             edge_src_list.append(edge_src)
             edge_dst_list.append(edge_dst)
             edge_rel_emb_list.append(edge_rel_emb)
+            edge_rel_id_list.append(np.asarray(edge_rel_ids, dtype=np.int64))
             edge_dir_list.append(edge_dir)
             edge_mask_list.append(np.ones((e,), dtype=np.bool_))
             q_emb_list.append(q_emb)
@@ -331,6 +334,7 @@ class SubgraphCollator:
         edge_src_t = torch.zeros((bsz, max_e), dtype=torch.long)
         edge_dst_t = torch.zeros((bsz, max_e), dtype=torch.long)
         edge_rel_emb_t = torch.zeros((bsz, max_e, self.relation_dim), dtype=torch.float32)
+        edge_rel_id_t = torch.zeros((bsz, max_e), dtype=torch.long)
         edge_dir_t = torch.zeros((bsz, max_e), dtype=torch.long)
         edge_mask_t = torch.zeros((bsz, max_e), dtype=torch.bool)
 
@@ -348,6 +352,7 @@ class SubgraphCollator:
                 edge_src_t[i, :e] = torch.from_numpy(edge_src_list[i])
                 edge_dst_t[i, :e] = torch.from_numpy(edge_dst_list[i])
                 edge_rel_emb_t[i, :e] = torch.from_numpy(edge_rel_emb_list[i])
+                edge_rel_id_t[i, :e] = torch.from_numpy(edge_rel_id_list[i])
                 edge_dir_t[i, :e] = torch.from_numpy(edge_dir_list[i])
                 edge_mask_t[i, :e] = torch.from_numpy(edge_mask_list[i])
             q_emb_t[i] = torch.from_numpy(q_emb_list[i])
@@ -361,6 +366,7 @@ class SubgraphCollator:
             "edge_src": edge_src_t,
             "edge_dst": edge_dst_t,
             "edge_rel_emb": edge_rel_emb_t,
+            "edge_rel_ids": edge_rel_id_t,
             "edge_dir": edge_dir_t,
             "edge_mask": edge_mask_t,
             "q_emb": q_emb_t,
@@ -418,6 +424,9 @@ class RecursiveSubgraphReader(nn.Module):
         rearev_trm_style_enabled: bool = False,
         rearev_trm_tminus1_no_grad: bool = True,
         rearev_trm_detach_carry: bool = True,
+        rearev_trm_supervise_all_stages: bool = False,
+        rearev_act_stop_in_train: bool = False,
+        rearev_asymmetric_yz_enabled: bool = False,
     ):
         super().__init__()
         self.entity_dim = int(entity_dim)
@@ -449,6 +458,9 @@ class RecursiveSubgraphReader(nn.Module):
         self.rearev_trm_style_enabled = bool(rearev_trm_style_enabled)
         self.rearev_trm_tminus1_no_grad = bool(rearev_trm_tminus1_no_grad)
         self.rearev_trm_detach_carry = bool(rearev_trm_detach_carry)
+        self.rearev_trm_supervise_all_stages = bool(rearev_trm_supervise_all_stages)
+        self.rearev_act_stop_in_train = bool(rearev_act_stop_in_train)
+        self.rearev_asymmetric_yz_enabled = bool(rearev_asymmetric_yz_enabled)
 
         self.node_proj = nn.Linear(self.entity_dim, self.hidden_size)
         self.rel_proj = nn.Linear(self.relation_dim, self.hidden_size)
@@ -508,6 +520,11 @@ class RecursiveSubgraphReader(nn.Module):
             self.rearev_halt_proj = nn.Linear(self.hidden_size, 1)
         else:
             self.rearev_halt_proj = None
+        if self.rearev_asymmetric_yz_enabled:
+            # Asymmetric y-update gate: combines current latent state z and previous y-context.
+            self.rearev_yz_update_gate = nn.Linear(self.hidden_size * 2, 1)
+        else:
+            self.rearev_yz_update_gate = None
         if self.outer_reasoning_enabled:
             self.outer_state_update = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
@@ -572,10 +589,11 @@ class RecursiveSubgraphReader(nn.Module):
         n: int,
         e: int,
         ref_h: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_edge_strength: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if e <= 0 or src is None or dst is None or rel_h is None or rel_h_inv is None:
             z = torch.zeros_like(ref_h)
-            return z, z
+            return z, z, None
         fact_query = instruction.unsqueeze(0).expand(e, -1)
 
         fact_val_fwd = F.relu(rel_linear(rel_h) * fact_query)
@@ -592,7 +610,13 @@ class RecursiveSubgraphReader(nn.Module):
         agg_inv = torch.zeros((n, self.hidden_size), dtype=ref_h.dtype, device=ref_h.device)
         agg_fwd.index_add_(0, dst, msg_fwd)
         agg_inv.index_add_(0, src, msg_inv)
-        return agg_fwd, agg_inv
+        edge_strength = None
+        if return_edge_strength:
+            edge_strength = (
+                fact_val_fwd.mean(dim=-1) * curr_dist[src]
+                + fact_val_inv.mean(dim=-1) * curr_dist[dst]
+            )
+        return agg_fwd, agg_inv, edge_strength
 
     def _inner_recur_rearev(
         self,
@@ -601,10 +625,12 @@ class RecursiveSubgraphReader(nn.Module):
         dst: Optional[torch.Tensor],
         rel_h: Optional[torch.Tensor],
         rel_h_inv: Optional[torch.Tensor],
+        edge_rel_ids: Optional[torch.Tensor],
         q_inj: torch.Tensor,
         seed_mask: Optional[torch.Tensor],
         n: int,
         e: int,
+        return_rel_trace: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         q_state = q_inj.squeeze(0)
         instructions = self.rearev_ins_proj(q_state).view(self.rearev_num_instructions, self.hidden_size)
@@ -614,16 +640,21 @@ class RecursiveSubgraphReader(nn.Module):
 
         h_stage = h
         score_tp = self._score_nodes(h_stage, latent_state)
+        curr_dist = seed_dist
         trm_step_logits: List[torch.Tensor] = []
         trm_step_halt_logits: List[torch.Tensor] = []
         trm_step_valid: List[torch.Tensor] = []
+        trace_step_logits: List[torch.Tensor] = []
+        trace_step_edge_importance: List[torch.Tensor] = []
         for stage_idx in range(self.rearev_adapt_stages):
-            curr_dist = seed_dist
+            y_prev_score = score_tp
+            y_prev_dist = curr_dist
             halt_mass = 0.0
             alive_prob = h_stage.new_tensor(1.0)
             for step_idx in range(self.recursion_steps):
                 rel_linear = self.rearev_rel_linears[step_idx]
                 e2e_linear = self.rearev_e2e_linears[step_idx]
+                reason_dist = y_prev_dist if self.rearev_asymmetric_yz_enabled else curr_dist
                 step_instructions = instructions
                 if self.rearev_latent_reasoning_enabled and self.rearev_latent_to_ins is not None:
                     ins_delta = self.rearev_latent_to_ins(latent_state).view(
@@ -639,11 +670,18 @@ class RecursiveSubgraphReader(nn.Module):
                     and ((step_idx + 1) < self.recursion_steps)
                 )
                 step_ctx = torch.no_grad if use_no_grad_prefix else nullcontext
+                should_break = False
+                score_for_trace = score_tp
                 with step_ctx():
                     neighbor_reps: List[torch.Tensor] = []
+                    step_edge_importance = (
+                        h_stage.new_zeros((e,), dtype=h_stage.dtype, device=h_stage.device)
+                        if (return_rel_trace and e > 0)
+                        else None
+                    )
                     for ins_idx in range(self.rearev_num_instructions):
-                        agg_fwd, agg_inv = self._reason_layer_pair(
-                            curr_dist=curr_dist,
+                        agg_fwd, agg_inv, edge_strength = self._reason_layer_pair(
+                            curr_dist=reason_dist,
                             instruction=step_instructions[ins_idx],
                             rel_linear=rel_linear,
                             rel_h=rel_h,
@@ -654,9 +692,12 @@ class RecursiveSubgraphReader(nn.Module):
                             n=n,
                             e=e,
                             ref_h=h_stage,
+                            return_edge_strength=return_rel_trace,
                         )
                         neighbor_reps.append(agg_fwd)
                         neighbor_reps.append(agg_inv)
+                        if step_edge_importance is not None and edge_strength is not None:
+                            step_edge_importance = step_edge_importance + edge_strength
                     prev_h = h_stage
                     prev_score = score_tp
                     prev_dist = curr_dist
@@ -672,6 +713,7 @@ class RecursiveSubgraphReader(nn.Module):
                         h_candidate = h_msg
                     score_candidate = self._score_nodes(h_candidate, prev_latent)
                     dist_candidate = torch.softmax(score_candidate, dim=0)
+                    score_for_trace = score_candidate
                     latent_candidate = prev_latent
                     if (
                         self.rearev_latent_reasoning_enabled
@@ -695,23 +737,46 @@ class RecursiveSubgraphReader(nn.Module):
                         alive_prob = alive_before * (1.0 - p_halt)
                         inv_alive = 1.0 - alive_prob
                         h_stage = alive_prob * h_candidate + inv_alive * prev_h
-                        score_tp = alive_prob * score_candidate + inv_alive * prev_score
-                        curr_dist = alive_prob * dist_candidate + inv_alive * prev_dist
+                        if self.rearev_asymmetric_yz_enabled:
+                            # Keep y fixed during inner z-updates; update y only once per outer stage.
+                            score_tp = prev_score
+                            curr_dist = prev_dist
+                        else:
+                            score_tp = alive_prob * score_candidate + inv_alive * prev_score
+                            curr_dist = alive_prob * dist_candidate + inv_alive * prev_dist
                         latent_state = alive_prob * latent_candidate + inv_alive * prev_latent
-                        if not self.training:
-                            halt_mass += float((alive_before * p_halt).item())
+                        if (not self.training) or self.rearev_act_stop_in_train:
+                            halt_mass += float((alive_before * p_halt).detach().item())
                             if (
                                 (step_idx + 1) >= self.rearev_dynamic_halting_min_steps
                                 and halt_mass >= self.rearev_dynamic_halting_threshold
                             ):
-                                break
+                                should_break = True
                     else:
                         h_stage = h_candidate
-                        score_tp = score_candidate
-                        curr_dist = dist_candidate
+                        if self.rearev_asymmetric_yz_enabled:
+                            score_tp = prev_score
+                            curr_dist = prev_dist
+                        else:
+                            score_tp = score_candidate
+                            curr_dist = dist_candidate
                         latent_state = latent_candidate
 
-                if self.rearev_trm_style_enabled and (stage_idx + 1) >= self.rearev_adapt_stages:
+                if return_rel_trace:
+                    trace_step_logits.append(score_for_trace if self.rearev_asymmetric_yz_enabled else score_tp)
+                    if step_edge_importance is None:
+                        trace_step_edge_importance.append(
+                            h_stage.new_zeros((e,), dtype=h_stage.dtype, device=h_stage.device)
+                        )
+                    else:
+                        trace_step_edge_importance.append(
+                            step_edge_importance / float(max(1, self.rearev_num_instructions))
+                        )
+
+                if self.rearev_trm_style_enabled and (not self.rearev_asymmetric_yz_enabled) and (
+                    self.rearev_trm_supervise_all_stages
+                    or ((stage_idx + 1) >= self.rearev_adapt_stages)
+                ):
                     trm_step_logits.append(score_tp)
                     if self.rearev_halt_proj is not None:
                         trm_step_halt_logits.append(self.rearev_halt_proj(latent_state).squeeze(-1))
@@ -728,6 +793,42 @@ class RecursiveSubgraphReader(nn.Module):
                         curr_dist = curr_dist.detach()
                         latent_state = latent_state.detach()
 
+                if should_break:
+                    break
+
+            if self.rearev_asymmetric_yz_enabled:
+                # Outer y-update: after inner z refinement loops, update y exactly once.
+                score_candidate_outer = self._score_nodes(h_stage, latent_state)
+                y_ctx = (h_stage * y_prev_dist.unsqueeze(-1)).sum(dim=0)
+                if self.rearev_yz_update_gate is not None:
+                    gate_in = torch.cat([latent_state, y_ctx], dim=-1).unsqueeze(0)
+                    update_ratio = torch.sigmoid(self.rearev_yz_update_gate(gate_in)).view(())
+                    update_ratio = update_ratio.clamp(min=0.0, max=1.0)
+                else:
+                    update_ratio = score_candidate_outer.new_tensor(1.0)
+                score_tp = update_ratio * score_candidate_outer + (1.0 - update_ratio) * y_prev_score
+                curr_dist = torch.softmax(score_tp, dim=0)
+
+                if self.rearev_trm_style_enabled and (
+                    self.rearev_trm_supervise_all_stages
+                    or ((stage_idx + 1) >= self.rearev_adapt_stages)
+                ):
+                    trm_step_logits.append(score_tp)
+                    if self.rearev_halt_proj is not None:
+                        trm_step_halt_logits.append(self.rearev_halt_proj(latent_state).squeeze(-1))
+                    else:
+                        trm_step_halt_logits.append(score_tp.new_zeros(()))
+                    trm_step_valid.append(torch.ones((), dtype=torch.bool, device=score_tp.device))
+                    if (
+                        self.training
+                        and self.rearev_trm_detach_carry
+                        and ((stage_idx + 1) < self.rearev_adapt_stages)
+                    ):
+                        h_stage = h_stage.detach()
+                        score_tp = score_tp.detach()
+                        curr_dist = curr_dist.detach()
+                        latent_state = latent_state.detach()
+
             if stage_idx + 1 >= self.rearev_adapt_stages:
                 break
             if self.rearev_reforms is not None:
@@ -737,19 +838,32 @@ class RecursiveSubgraphReader(nn.Module):
                 instructions = torch.stack(updated, dim=0)
 
         trm_aux = None
-        if self.rearev_trm_style_enabled:
-            if trm_step_logits:
-                trm_aux = {
-                    "step_logits": torch.stack(trm_step_logits, dim=0),
-                    "step_halt_logits": torch.stack(trm_step_halt_logits, dim=0),
-                    "step_valid_mask": torch.stack(trm_step_valid, dim=0),
-                }
-            else:
-                trm_aux = {
-                    "step_logits": score_tp.new_full((0, n), -1e4),
-                    "step_halt_logits": score_tp.new_zeros((0,)),
-                    "step_valid_mask": torch.zeros((0,), dtype=torch.bool, device=score_tp.device),
-                }
+        if self.rearev_trm_style_enabled or return_rel_trace:
+            trm_aux = {}
+            if self.rearev_trm_style_enabled:
+                if trm_step_logits:
+                    trm_aux["step_logits"] = torch.stack(trm_step_logits, dim=0)
+                    trm_aux["step_halt_logits"] = torch.stack(trm_step_halt_logits, dim=0)
+                    trm_aux["step_valid_mask"] = torch.stack(trm_step_valid, dim=0)
+                else:
+                    trm_aux["step_logits"] = score_tp.new_full((0, n), -1e4)
+                    trm_aux["step_halt_logits"] = score_tp.new_zeros((0,))
+                    trm_aux["step_valid_mask"] = torch.zeros(
+                        (0,), dtype=torch.bool, device=score_tp.device
+                    )
+            if return_rel_trace:
+                if trace_step_logits:
+                    trm_aux["trace_step_logits"] = torch.stack(trace_step_logits, dim=0)
+                    trm_aux["trace_step_edge_importance"] = torch.stack(
+                        trace_step_edge_importance, dim=0
+                    )
+                else:
+                    trm_aux["trace_step_logits"] = score_tp.new_full((0, n), -1e4)
+                    trm_aux["trace_step_edge_importance"] = score_tp.new_zeros((0, e))
+                if edge_rel_ids is None or int(edge_rel_ids.numel()) <= 0:
+                    trm_aux["trace_edge_rel_ids"] = score_tp.new_full((e,), -1, dtype=torch.long)
+                else:
+                    trm_aux["trace_edge_rel_ids"] = edge_rel_ids[:e].to(dtype=torch.long)
 
         return h_stage, score_tp, trm_aux
 
@@ -760,10 +874,12 @@ class RecursiveSubgraphReader(nn.Module):
         dst: Optional[torch.Tensor],
         rel_h: Optional[torch.Tensor],
         rel_h_inv: Optional[torch.Tensor],
+        edge_rel_ids: Optional[torch.Tensor],
         q_inj: torch.Tensor,
         seed_mask: Optional[torch.Tensor],
         n: int,
         e: int,
+        return_rel_trace: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         return self._inner_recur_rearev(
             h=h,
@@ -771,10 +887,12 @@ class RecursiveSubgraphReader(nn.Module):
             dst=dst,
             rel_h=rel_h,
             rel_h_inv=rel_h_inv,
+            edge_rel_ids=edge_rel_ids,
             q_inj=q_inj,
             seed_mask=seed_mask,
             n=n,
             e=e,
+            return_rel_trace=return_rel_trace,
         )
 
     def forward(
@@ -785,23 +903,49 @@ class RecursiveSubgraphReader(nn.Module):
         edge_src: torch.Tensor,
         edge_dst: torch.Tensor,
         edge_rel_emb: torch.Tensor,
+        edge_rel_ids: Optional[torch.Tensor],
         edge_dir: Optional[torch.Tensor],
         edge_mask: torch.Tensor,
         q_emb: torch.Tensor,
         return_aux: bool = False,
+        return_rel_trace: bool = False,
     ):
         bsz, max_n, _ = node_emb.shape
         qh = self.q_proj(q_emb)
         h_all = self.node_proj(node_emb)
         logits = node_emb.new_full((bsz, max_n), -1e4)
+        need_aux = bool(return_aux or return_rel_trace)
         step_logits = None
         step_halt_logits = None
         step_valid_mask = None
+        trace_step_logits = None
+        trace_step_edge_importance = None
+        trace_step_valid_mask = None
+        trace_edge_rel_ids = None
+        aux_steps = int(self.recursion_steps)
+        if self.rearev_trm_supervise_all_stages:
+            aux_steps = int(max(1, self.rearev_adapt_stages))
+            if not self.rearev_asymmetric_yz_enabled:
+                aux_steps = int(self.recursion_steps * max(1, self.rearev_adapt_stages))
+        else:
+            if self.rearev_asymmetric_yz_enabled:
+                aux_steps = 1
         if return_aux:
-            step_logits = node_emb.new_full((bsz, self.recursion_steps, max_n), -1e4)
-            step_halt_logits = node_emb.new_zeros((bsz, self.recursion_steps))
+            step_logits = node_emb.new_full((bsz, aux_steps, max_n), -1e4)
+            step_halt_logits = node_emb.new_zeros((bsz, aux_steps))
             step_valid_mask = torch.zeros(
-                (bsz, self.recursion_steps), dtype=torch.bool, device=node_emb.device
+                (bsz, aux_steps), dtype=torch.bool, device=node_emb.device
+            )
+        if return_rel_trace:
+            trace_steps = int(self.recursion_steps * max(1, self.rearev_adapt_stages))
+            max_e = int(edge_mask.shape[1]) if edge_mask.ndim == 2 else 0
+            trace_step_logits = node_emb.new_full((bsz, trace_steps, max_n), -1e4)
+            trace_step_edge_importance = node_emb.new_zeros((bsz, trace_steps, max_e))
+            trace_step_valid_mask = torch.zeros(
+                (bsz, trace_steps), dtype=torch.bool, device=node_emb.device
+            )
+            trace_edge_rel_ids = torch.full(
+                (bsz, max_e), -1, dtype=torch.long, device=node_emb.device
             )
 
         for i in range(bsz):
@@ -818,6 +962,7 @@ class RecursiveSubgraphReader(nn.Module):
                 dst = edge_dst[i, :e].long()
                 rel_h = self.rel_proj(edge_rel_emb[i, :e])
                 rel_h_inv = self.rel_proj_inv(edge_rel_emb[i, :e])
+                rel_ids = edge_rel_ids[i, :e].long() if edge_rel_ids is not None else None
                 if self.use_direction_embedding and edge_dir is not None:
                     dir_ids = edge_dir[i, :e].long().clamp(min=0, max=1)
                     rel_h = rel_h + self.edge_dir_emb(dir_ids)
@@ -827,6 +972,7 @@ class RecursiveSubgraphReader(nn.Module):
                 dst = None
                 rel_h = None
                 rel_h_inv = None
+                rel_ids = None
 
             if not self.outer_reasoning_enabled:
                 h, y_logits, trm_aux = self._run_inner(
@@ -835,10 +981,12 @@ class RecursiveSubgraphReader(nn.Module):
                     dst=dst,
                     rel_h=rel_h,
                     rel_h_inv=rel_h_inv,
+                    edge_rel_ids=rel_ids,
                     q_inj=qb,
                     seed_mask=seed_i,
                     n=n,
                     e=e,
+                    return_rel_trace=return_rel_trace,
                 )
             else:
                 z = qb.squeeze(0)
@@ -857,10 +1005,12 @@ class RecursiveSubgraphReader(nn.Module):
                         dst=dst,
                         rel_h=rel_h,
                         rel_h_inv=rel_h_inv,
+                        edge_rel_ids=rel_ids,
                         q_inj=q_loop,
                         seed_mask=seed_i,
                         n=n,
                         e=e,
+                        return_rel_trace=False,
                     )
 
             logits[i, :n] = y_logits
@@ -868,19 +1018,39 @@ class RecursiveSubgraphReader(nn.Module):
                 local_step_logits = trm_aux["step_logits"]
                 local_halt = trm_aux["step_halt_logits"]
                 local_valid = trm_aux["step_valid_mask"]
-                s = min(self.recursion_steps, int(local_step_logits.shape[0]))
+                s = min(int(step_logits.shape[1]), int(local_step_logits.shape[0]))
                 if s > 0:
                     step_logits[i, :s, :n] = local_step_logits[:s, :n]
                     step_halt_logits[i, :s] = local_halt[:s]
                     step_valid_mask[i, :s] = local_valid[:s]
+            if return_rel_trace and trm_aux is not None and trace_step_logits is not None:
+                local_trace_logits = trm_aux.get("trace_step_logits", None)
+                local_trace_edges = trm_aux.get("trace_step_edge_importance", None)
+                local_trace_rel_ids = trm_aux.get("trace_edge_rel_ids", None)
+                if local_trace_logits is not None:
+                    s_trace = min(int(trace_step_logits.shape[1]), int(local_trace_logits.shape[0]))
+                    if s_trace > 0:
+                        trace_step_logits[i, :s_trace, :n] = local_trace_logits[:s_trace, :n]
+                        trace_step_valid_mask[i, :s_trace] = True
+                        if local_trace_edges is not None and e > 0:
+                            trace_step_edge_importance[i, :s_trace, :e] = local_trace_edges[:s_trace, :e]
+                if local_trace_rel_ids is not None and e > 0:
+                    trace_edge_rel_ids[i, :e] = local_trace_rel_ids[:e]
 
-        if return_aux:
-            return {
+        if need_aux:
+            out = {
                 "logits": logits,
-                "step_logits": step_logits,
-                "step_halt_logits": step_halt_logits,
-                "step_valid_mask": step_valid_mask,
             }
+            if return_aux:
+                out["step_logits"] = step_logits
+                out["step_halt_logits"] = step_halt_logits
+                out["step_valid_mask"] = step_valid_mask
+            if return_rel_trace:
+                out["trace_step_logits"] = trace_step_logits
+                out["trace_step_edge_importance"] = trace_step_edge_importance
+                out["trace_step_valid_mask"] = trace_step_valid_mask
+                out["trace_edge_rel_ids"] = trace_edge_rel_ids
+            return out
         return logits
 
 
@@ -900,6 +1070,7 @@ def _masked_rearev_kl_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    no_positive_mode: str = "uniform",
 ) -> Tuple[torch.Tensor, int]:
     # ReaRev-style objective:
     # minimize KL( target_answer_distribution || predicted_entity_distribution )
@@ -912,12 +1083,23 @@ def _masked_rearev_kl_loss(
     tgt_sum = tgt.sum(dim=1, keepdim=True)
     has_pos = tgt_sum.squeeze(-1) > 0
 
-    # Fallback keeps loss finite for malformed rows with no positive answer.
+    mode = str(no_positive_mode or "uniform").strip().lower()
+    if mode in {"skip", "mask", "drop"}:
+        # Do not force uniform targets for rows without positives.
+        # This avoids over-regularizing mid-search/no-answer rows.
+        if not bool(has_pos.any().item()):
+            return logits.new_tensor(0.0), 0
+        tgt_dist = tgt / tgt_sum.clamp(min=1.0)
+        tgt_dist = tgt_dist / tgt_dist.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        kl = F.kl_div(log_pred, tgt_dist, reduction="none").sum(dim=1)
+        kl = kl[has_pos]
+        return kl.mean(), int(has_pos.to(torch.int64).sum().item())
+
+    # Legacy behavior: fallback keeps loss finite for rows with no positives.
     valid_cnt = valid.to(torch.float32).sum(dim=1, keepdim=True).clamp(min=1.0)
     uniform = valid.to(torch.float32) / valid_cnt
     tgt_dist = torch.where(has_pos.unsqueeze(-1), tgt / tgt_sum.clamp(min=1.0), uniform)
     tgt_dist = tgt_dist / tgt_dist.sum(dim=1, keepdim=True).clamp(min=1e-12)
-
     kl = F.kl_div(log_pred, tgt_dist, reduction="none").sum(dim=1)
     return kl.mean(), int(has_pos.to(torch.int64).sum().item())
 
@@ -1146,6 +1328,7 @@ def evaluate_subgraph_reader(
             edge_src=batch_dev["edge_src"],
             edge_dst=batch_dev["edge_dst"],
             edge_rel_emb=batch_dev["edge_rel_emb"],
+            edge_rel_ids=batch_dev.get("edge_rel_ids", None),
             edge_dir=batch_dev.get("edge_dir", None),
             edge_mask=batch_dev["edge_mask"],
             q_emb=batch_dev["q_emb"],
@@ -1176,6 +1359,329 @@ def evaluate_subgraph_reader(
     if return_counts:
         return mean_hit, mean_f1, mean_precision, mean_recall, int(skip), int(n_valid)
     return mean_hit, mean_f1, mean_precision, mean_recall, int(skip)
+
+
+def _load_relation_text_labels(relations_txt: str) -> Tuple[List[str], List[str]]:
+    rel_ids: List[str] = []
+    with open(relations_txt, "r", encoding="utf-8") as f:
+        for line in f:
+            rel_ids.append(line.strip())
+
+    cand_paths: List[str] = []
+    rel_dir = os.path.dirname(relations_txt)
+    rel_base = os.path.basename(relations_txt)
+    cand_paths.append(os.path.join(rel_dir, "relation_names_used.txt"))
+    if rel_base.endswith("_ids.txt"):
+        cand_paths.append(
+            os.path.join(rel_dir, rel_base.replace("_ids.txt", "_names_used.txt"))
+        )
+    if rel_base.endswith("relations.txt"):
+        cand_paths.append(os.path.join(rel_dir, "relations_names_used.txt"))
+
+    rel_names: Optional[List[str]] = None
+    for p in cand_paths:
+        if not p or (not os.path.exists(p)):
+            continue
+        try:
+            names = []
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    names.append(line.strip())
+            if len(names) == len(rel_ids) and len(names) > 0:
+                rel_names = names
+                break
+        except Exception:
+            continue
+
+    if rel_names is None:
+        rel_names = []
+        for rid in rel_ids:
+            txt = rid.replace(".", " ").replace("_", " ").replace("/", " ").replace(":", " ")
+            txt = re.sub(r"\s+", " ", txt).strip()
+            rel_names.append(txt if txt else rid)
+
+    return rel_ids, rel_names
+
+
+def _load_entity_text_labels(entities_txt: str) -> List[str]:
+    labels: List[str] = []
+    with open(entities_txt, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            ent_id = parts[0].strip() if parts else ""
+            ent_name = parts[1].strip() if len(parts) > 1 else ""
+            if ent_name and ent_name != ent_id:
+                labels.append(f"{ent_name} <{ent_id}>")
+            else:
+                labels.append(ent_id)
+    return labels
+
+
+@torch.no_grad()
+def debug_relation_topk_trace(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    relation_ids: Optional[List[str]],
+    relation_labels: Optional[List[str]],
+    entity_labels: Optional[List[str]],
+    topk: int,
+    log_examples: int,
+    is_main: bool,
+    path_dump_jsonl: str = "",
+    dump_max_examples: int = 1000,
+):
+    if not is_main:
+        return
+    model.eval()
+    k = max(1, int(topk))
+    max_log_n = max(0, int(log_examples))
+    max_dump_n = max(0, int(dump_max_examples))
+    rid_list = relation_ids if isinstance(relation_ids, list) else []
+    rlabel_list = relation_labels if isinstance(relation_labels, list) else []
+    elabel_list = entity_labels if isinstance(entity_labels, list) else []
+    dump_path = str(path_dump_jsonl or "").strip()
+    dump_f = None
+    if dump_path:
+        dump_dir = os.path.dirname(dump_path)
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        dump_f = open(dump_path, "w", encoding="utf-8")
+    if max_log_n <= 0 and (dump_f is None or max_dump_n <= 0):
+        if dump_f is not None:
+            dump_f.close()
+        return
+    max_n = max(max_log_n, (max_dump_n if dump_f is not None else 0))
+
+    def _ent_text(cid: int) -> str:
+        if 0 <= int(cid) < len(elabel_list):
+            return str(elabel_list[int(cid)])
+        return str(cid)
+
+    seen = 0
+    try:
+        for batch in loader:
+            batch_dev = _move_batch_to_device(batch, device)
+            out = model(
+                node_emb=batch_dev["node_emb"],
+                node_mask=batch_dev["node_mask"],
+                seed_mask=batch_dev.get("seed_mask", None),
+                edge_src=batch_dev["edge_src"],
+                edge_dst=batch_dev["edge_dst"],
+                edge_rel_emb=batch_dev["edge_rel_emb"],
+                edge_rel_ids=batch_dev.get("edge_rel_ids", None),
+                edge_dir=batch_dev.get("edge_dir", None),
+                edge_mask=batch_dev["edge_mask"],
+                q_emb=batch_dev["q_emb"],
+                return_rel_trace=True,
+            )
+            trace_logits = out.get("trace_step_logits", None)
+            trace_edge_importance = out.get("trace_step_edge_importance", None)
+            trace_step_valid = out.get("trace_step_valid_mask", None)
+            trace_edge_rel_ids = out.get("trace_edge_rel_ids", None)
+            if (
+                trace_logits is None
+                or trace_edge_importance is None
+                or trace_step_valid is None
+                or trace_edge_rel_ids is None
+            ):
+                if seen < max_log_n:
+                    print("[Trace-RelTopK] trace output unavailable.")
+                return
+
+            bsz = int(trace_logits.shape[0])
+            for i in range(bsz):
+                if seen >= max_n:
+                    return
+                do_log = seen < max_log_n
+                do_dump = (dump_f is not None) and (seen < max_dump_n)
+                n = int(batch_dev["node_mask"][i].sum().item())
+                e = int(batch_dev["edge_mask"][i].sum().item()) if batch_dev["edge_mask"].shape[1] > 0 else 0
+                orig_id = ""
+                try:
+                    orig_id = str(batch.get("orig_ids", [""])[i])
+                except Exception:
+                    orig_id = ""
+                if do_log:
+                    print(
+                        f"[Trace-RelTopK] ex={seen} orig_id={orig_id} valid_nodes={n} "
+                        f"valid_edges={e}"
+                    )
+                if n <= 0 or e <= 0:
+                    if do_log:
+                        print("  - no valid node/edge in sampled subgraph")
+                    seen += 1
+                    continue
+
+                step_ids = torch.nonzero(trace_step_valid[i], as_tuple=False).squeeze(-1)
+                if step_ids.numel() <= 0:
+                    if do_log:
+                        print("  - no valid recursion steps traced")
+                    seen += 1
+                    continue
+
+                rel_ids = trace_edge_rel_ids[i, :e].to(torch.long)
+                valid_rel_edge = rel_ids >= 0
+                if not bool(valid_rel_edge.any()):
+                    if do_log:
+                        print("  - no valid relation ids on edges")
+                    seen += 1
+                    continue
+
+                node_cids = batch_dev["node_cids"][i, :n].to(torch.long)
+                edge_src = batch_dev["edge_src"][i, :e].to(torch.long)
+                edge_dst = batch_dev["edge_dst"][i, :e].to(torch.long)
+                edge_valid = batch_dev["edge_mask"][i, :e].to(torch.bool)
+
+                step_topk_summary = []
+                for t in step_ids.tolist():
+                    edge_scores = trace_edge_importance[i, t, :e]
+                    keep = valid_rel_edge
+                    rel_ids_kept = rel_ids[keep]
+                    score_kept = edge_scores[keep]
+                    if rel_ids_kept.numel() <= 0:
+                        continue
+
+                    uniq_rel, inv = torch.unique(rel_ids_kept, sorted=False, return_inverse=True)
+                    rel_score = torch.zeros((uniq_rel.numel(),), dtype=score_kept.dtype, device=score_kept.device)
+                    rel_score.index_add_(0, inv, score_kept)
+                    kk = min(k, int(uniq_rel.numel()))
+                    topv, topi = torch.topk(rel_score, k=kk, largest=True)
+
+                    node_logit = trace_logits[i, t, :n]
+                    node_prob = torch.softmax(node_logit, dim=0)
+                    node_kk = min(k, int(n))
+                    node_topv, node_topi = torch.topk(node_logit, k=node_kk, largest=True)
+                    best_local_idx = int(node_topi[0].item()) if node_kk > 0 else int(torch.argmax(node_prob).item())
+                    best_cid = int(node_cids[best_local_idx].item()) if best_local_idx < int(node_cids.numel()) else -1
+                    node_items = []
+                    node_items_obj = []
+                    for jj in range(node_kk):
+                        local_idx = int(node_topi[jj].item())
+                        cid = int(node_cids[local_idx].item()) if local_idx < int(node_cids.numel()) else -1
+                        nlogit = float(node_topv[jj].item())
+                        nprob = float(node_prob[local_idx].item()) if 0 <= local_idx < int(node_prob.numel()) else 0.0
+                        ntext = _ent_text(cid)
+                        node_items.append(f"{ntext}({nlogit:.4f}|p={nprob:.4f})")
+                        node_items_obj.append(
+                            {
+                                "local_idx": int(local_idx),
+                                "cid": int(cid),
+                                "text": str(ntext),
+                                "logit": float(nlogit),
+                                "prob": float(nprob),
+                            }
+                        )
+
+                    rel_items = []
+                    rel_items_obj = []
+                    for jj in range(kk):
+                        rid = int(uniq_rel[topi[jj]].item())
+                        rid_raw = rid_list[rid] if 0 <= rid < len(rid_list) else f"rid:{rid}"
+                        rname = rlabel_list[rid] if 0 <= rid < len(rlabel_list) else rid_raw
+                        rscore = float(topv[jj].item())
+                        if rname != rid_raw:
+                            rel_items.append(f"{rname} <{rid_raw}> ({rscore:.4f})")
+                        else:
+                            rel_items.append(f"{rname}({rscore:.4f})")
+                        rel_items_obj.append(
+                            {
+                                "relation_index": int(rid),
+                                "relation_id": str(rid_raw),
+                                "relation_text": str(rname),
+                                "score": float(rscore),
+                            }
+                        )
+                    if do_log:
+                        print(
+                            f"  step={int(t)+1} best_node_cid={best_cid} "
+                            f"top{k}_relations=[{', '.join(rel_items)}]"
+                        )
+                        print(f"          top{node_kk}_nodes=[{', '.join(node_items)}]")
+                    step_topk_summary.append(
+                        {
+                            "step": int(t) + 1,
+                            "best_node_cid": int(best_cid),
+                            "best_node_text": _ent_text(best_cid),
+                            "top_nodes": node_items_obj,
+                            "top_relations": rel_items_obj,
+                        }
+                    )
+
+                seed_local = torch.nonzero(batch_dev["seed_mask"][i, :n], as_tuple=False).squeeze(-1)
+                if seed_local.numel() <= 0:
+                    cur_local = 0
+                else:
+                    cur_local = int(seed_local[0].item())
+                cur_cid = int(node_cids[cur_local].item()) if 0 <= cur_local < int(node_cids.numel()) else -1
+                path_hops = []
+                path_text_parts = [_ent_text(cur_cid)]
+                for t in step_ids.tolist():
+                    row_logits = trace_logits[i, t, :n]
+                    row_prob = torch.softmax(row_logits, dim=0)
+                    row_edge_score = trace_edge_importance[i, t, :e]
+                    out_mask = edge_valid & valid_rel_edge & (edge_src == int(cur_local))
+                    out_idx = torch.nonzero(out_mask, as_tuple=False).squeeze(-1)
+                    if out_idx.numel() <= 0:
+                        break
+                    dst_nodes = edge_dst[out_idx].to(torch.long)
+                    cand_score = row_edge_score[out_idx] + row_prob[dst_nodes]
+                    best_pos = int(torch.argmax(cand_score).item())
+                    edge_idx = int(out_idx[best_pos].item())
+                    nxt_local = int(edge_dst[edge_idx].item())
+                    nxt_cid = int(node_cids[nxt_local].item()) if 0 <= nxt_local < int(node_cids.numel()) else -1
+                    rid = int(rel_ids[edge_idx].item())
+                    rid_raw = rid_list[rid] if 0 <= rid < len(rid_list) else f"rid:{rid}"
+                    rname = rlabel_list[rid] if 0 <= rid < len(rlabel_list) else rid_raw
+                    hop = {
+                        "step": int(t) + 1,
+                        "from_local_idx": int(cur_local),
+                        "from_cid": int(cur_cid),
+                        "from_text": _ent_text(cur_cid),
+                        "edge_idx": int(edge_idx),
+                        "relation_index": int(rid),
+                        "relation_id": str(rid_raw),
+                        "relation_text": str(rname),
+                        "to_local_idx": int(nxt_local),
+                        "to_cid": int(nxt_cid),
+                        "to_text": _ent_text(nxt_cid),
+                        "edge_score": float(row_edge_score[edge_idx].item()),
+                        "to_node_prob": float(row_prob[nxt_local].item()),
+                        "combined_score": float(cand_score[best_pos].item()),
+                    }
+                    path_hops.append(hop)
+                    if rname != rid_raw:
+                        path_text_parts.append(f"--[{rname} <{rid_raw}>]--> {_ent_text(nxt_cid)}")
+                    else:
+                        path_text_parts.append(f"--[{rname}]--> {_ent_text(nxt_cid)}")
+                    cur_local = nxt_local
+                    cur_cid = nxt_cid
+                if do_log:
+                    if path_hops:
+                        print(f"  explicit_path: {' '.join(path_text_parts)}")
+                    else:
+                        print("  explicit_path: (no outgoing edge from seed on traced steps)")
+
+                if do_dump:
+                    rec = {
+                        "example_index": int(seen),
+                        "orig_id": str(orig_id),
+                        "seed_cid": int(path_hops[0]["from_cid"]) if path_hops else int(cur_cid),
+                        "seed_text": (
+                            str(path_hops[0]["from_text"])
+                            if path_hops
+                            else _ent_text(cur_cid)
+                        ),
+                        "path_hops": path_hops,
+                        "path_text": " ".join(path_text_parts),
+                        "step_topk_relations": step_topk_summary,
+                    }
+                    dump_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                seen += 1
+    finally:
+        if dump_f is not None:
+            dump_f.close()
 
 
 def _safe_load_state_dict(model: nn.Module, sd: dict) -> Tuple[int, int]:
@@ -1238,6 +1744,9 @@ def _load_model_from_ckpt_or_init(
     rearev_trm_style_enabled: bool = False,
     rearev_trm_tminus1_no_grad: bool = True,
     rearev_trm_detach_carry: bool = True,
+    rearev_trm_supervise_all_stages: bool = False,
+    rearev_act_stop_in_train: bool = False,
+    rearev_asymmetric_yz_enabled: bool = False,
 ) -> Tuple[RecursiveSubgraphReader, Optional[dict]]:
     meta = None
     if ckpt_path and os.path.exists(ckpt_path):
@@ -1291,6 +1800,16 @@ def _load_model_from_ckpt_or_init(
                 rearev_trm_tminus1_no_grad = _as_bool(model_cfg.get("rearev_trm_tminus1_no_grad", True))
             if isinstance(model_cfg, dict) and "rearev_trm_detach_carry" in model_cfg:
                 rearev_trm_detach_carry = _as_bool(model_cfg.get("rearev_trm_detach_carry", True))
+            if isinstance(model_cfg, dict) and "rearev_trm_supervise_all_stages" in model_cfg:
+                rearev_trm_supervise_all_stages = _as_bool(
+                    model_cfg.get("rearev_trm_supervise_all_stages", False)
+                )
+            if isinstance(model_cfg, dict) and "rearev_act_stop_in_train" in model_cfg:
+                rearev_act_stop_in_train = _as_bool(model_cfg.get("rearev_act_stop_in_train", False))
+            if isinstance(model_cfg, dict) and "rearev_asymmetric_yz_enabled" in model_cfg:
+                rearev_asymmetric_yz_enabled = _as_bool(
+                    model_cfg.get("rearev_asymmetric_yz_enabled", False)
+                )
 
     model = RecursiveSubgraphReader(
         entity_dim=entity_dim,
@@ -1316,6 +1835,9 @@ def _load_model_from_ckpt_or_init(
         rearev_trm_style_enabled=bool(rearev_trm_style_enabled),
         rearev_trm_tminus1_no_grad=bool(rearev_trm_tminus1_no_grad),
         rearev_trm_detach_carry=bool(rearev_trm_detach_carry),
+        rearev_trm_supervise_all_stages=bool(rearev_trm_supervise_all_stages),
+        rearev_act_stop_in_train=bool(rearev_act_stop_in_train),
+        rearev_asymmetric_yz_enabled=bool(rearev_asymmetric_yz_enabled),
     )
     if ckpt_path and os.path.exists(ckpt_path):
         obj = meta if meta is not None else torch.load(ckpt_path, map_location="cpu")
@@ -1404,6 +1926,15 @@ def train_subgraph_reader(
     rearev_trm_detach_carry = _as_bool(
         getattr(args, "subgraph_rearev_trm_detach_carry", True), default=True
     )
+    rearev_trm_supervise_all_stages = _as_bool(
+        getattr(args, "subgraph_rearev_trm_supervise_all_stages", False)
+    )
+    rearev_act_stop_in_train = _as_bool(
+        getattr(args, "subgraph_rearev_act_stop_in_train", False)
+    )
+    rearev_asymmetric_yz_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_asymmetric_yz_enabled", False)
+    )
     rearev_trm_halt_bce_weight = max(
         0.0, float(getattr(args, "subgraph_rearev_trm_halt_bce_weight", 1.0))
     )
@@ -1431,6 +1962,9 @@ def train_subgraph_reader(
     hard_negative_topk = max(1, int(getattr(args, "subgraph_hard_negative_topk", 16)))
     bce_hard_negative_enabled = _as_bool(getattr(args, "subgraph_bce_hard_negative_enabled", False))
     bce_hard_negative_topk = max(1, int(getattr(args, "subgraph_bce_hard_negative_topk", 64)))
+    kl_no_positive_mode = str(getattr(args, "subgraph_kl_no_positive_mode", "uniform")).strip().lower()
+    if kl_no_positive_mode not in {"uniform", "skip", "mask", "drop"}:
+        kl_no_positive_mode = "uniform"
     uses_kl_objective = loss_mode in {"rearev_kl", "rearev_kl_rank"}
     uses_kl_trm_objective = loss_mode == "rearev_kl_trm"
     uses_trm_objective = loss_mode == "rearev_trm"
@@ -1478,6 +2012,13 @@ def train_subgraph_reader(
     lr_plateau_metric = str(getattr(args, "subgraph_lr_plateau_metric", "train_loss")).strip().lower()
     if lr_plateau_metric not in {"train_loss", "dev_hit1", "dev_f1"}:
         lr_plateau_metric = "train_loss"
+    early_stop_enabled = _as_bool(getattr(args, "subgraph_early_stop_enabled", False))
+    early_stop_metric = str(getattr(args, "subgraph_early_stop_metric", "dev_hit1")).strip().lower()
+    if early_stop_metric not in {"train_loss", "dev_hit1", "dev_f1"}:
+        early_stop_metric = "dev_hit1"
+    early_stop_patience = max(0, int(getattr(args, "subgraph_early_stop_patience", 0)))
+    early_stop_min_delta = float(getattr(args, "subgraph_early_stop_min_delta", 1e-4))
+    early_stop_min_epochs = max(1, int(getattr(args, "subgraph_early_stop_min_epochs", 1)))
     grad_accum_steps = max(1, int(getattr(args, "subgraph_grad_accum_steps", 1)))
     resume_epoch_cfg = int(getattr(args, "subgraph_resume_epoch", -1))
     if resume_epoch_cfg >= 0:
@@ -1541,6 +2082,9 @@ def train_subgraph_reader(
         rearev_trm_style_enabled=rearev_trm_style_enabled,
         rearev_trm_tminus1_no_grad=rearev_trm_tminus1_no_grad,
         rearev_trm_detach_carry=rearev_trm_detach_carry,
+        rearev_trm_supervise_all_stages=rearev_trm_supervise_all_stages,
+        rearev_act_stop_in_train=rearev_act_stop_in_train,
+        rearev_asymmetric_yz_enabled=rearev_asymmetric_yz_enabled,
     )
     model.to(device)
     ddp_find_unused_default = bool(
@@ -1634,6 +2178,9 @@ def train_subgraph_reader(
             f"rearev_trm_style={rearev_trm_style_enabled} "
             f"rearev_trm_tminus1_nograd={rearev_trm_tminus1_no_grad} "
             f"rearev_trm_detach_carry={rearev_trm_detach_carry} "
+            f"rearev_trm_all_stages={rearev_trm_supervise_all_stages} "
+            f"rearev_act_stop_train={rearev_act_stop_in_train} "
+            f"rearev_asym_yz={rearev_asymmetric_yz_enabled} "
             f"rearev_trm_halt_w={rearev_trm_halt_bce_weight:.3f} "
             f"rearev_trm_ce_w={rearev_trm_ce_weight:.3f} "
             f"rearev_trm_w={rearev_trm_weight:.3f} "
@@ -1641,7 +2188,13 @@ def train_subgraph_reader(
             f"deep_sup_w={deep_supervision_weight:.3f} "
             f"deep_sup_ce_w={deep_supervision_ce_weight:.3f} "
             f"deep_sup_halt_w={deep_supervision_halt_weight:.3f} "
+            f"kl_no_pos={kl_no_positive_mode} "
             f"ddp_find_unused={ddp_find_unused} "
+            f"early_stop={early_stop_enabled} "
+            f"early_stop_metric={early_stop_metric} "
+            f"early_stop_patience={early_stop_patience} "
+            f"early_stop_min_delta={early_stop_min_delta:.6g} "
+            f"early_stop_min_epochs={early_stop_min_epochs} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
             f"bce_hardneg={bce_hard_negative_enabled} "
@@ -1650,6 +2203,9 @@ def train_subgraph_reader(
         )
         if resume_epoch > 0:
             print(f"[SubgraphReader-Resume] start_from_ep={resume_epoch}")
+
+    early_best_metric = None
+    early_bad_epochs = 0
 
     for local_ep in range(1, int(args.epochs) + 1):
         ep = int(resume_epoch + local_ep)
@@ -1679,6 +2235,7 @@ def train_subgraph_reader(
                 edge_src=batch_dev["edge_src"],
                 edge_dst=batch_dev["edge_dst"],
                 edge_rel_emb=batch_dev["edge_rel_emb"],
+                edge_rel_ids=batch_dev.get("edge_rel_ids", None),
                 edge_dir=batch_dev.get("edge_dir", None),
                 edge_mask=batch_dev["edge_mask"],
                 q_emb=batch_dev["q_emb"],
@@ -1725,6 +2282,7 @@ def train_subgraph_reader(
                     logits=logits,
                     targets=batch_dev["node_labels"],
                     mask=batch_dev["node_mask"],
+                    no_positive_mode=kl_no_positive_mode,
                 )
                 trm_ce_component, trm_aux = _masked_trm_step_ce_loss(
                     step_logits=step_logits,
@@ -1750,6 +2308,7 @@ def train_subgraph_reader(
                     logits=logits,
                     targets=batch_dev["node_labels"],
                     mask=batch_dev["node_mask"],
+                    no_positive_mode=kl_no_positive_mode,
                 )
                 kl_component = obj_loss
                 if uses_kl_deep_supervision:
@@ -1990,6 +2549,9 @@ def train_subgraph_reader(
                     "rearev_trm_style_enabled": bool(rearev_trm_style_enabled),
                     "rearev_trm_tminus1_no_grad": bool(rearev_trm_tminus1_no_grad),
                     "rearev_trm_detach_carry": bool(rearev_trm_detach_carry),
+                    "rearev_trm_supervise_all_stages": bool(rearev_trm_supervise_all_stages),
+                    "rearev_act_stop_in_train": bool(rearev_act_stop_in_train),
+                    "rearev_asymmetric_yz_enabled": bool(rearev_asymmetric_yz_enabled),
                 },
                 "subgraph_cfg": {
                     "hops": int(hops),
@@ -2015,6 +2577,9 @@ def train_subgraph_reader(
                     "rearev_trm_style_enabled": bool(rearev_trm_style_enabled),
                     "rearev_trm_tminus1_no_grad": bool(rearev_trm_tminus1_no_grad),
                     "rearev_trm_detach_carry": bool(rearev_trm_detach_carry),
+                    "rearev_trm_supervise_all_stages": bool(rearev_trm_supervise_all_stages),
+                    "rearev_act_stop_in_train": bool(rearev_act_stop_in_train),
+                    "rearev_asymmetric_yz_enabled": bool(rearev_asymmetric_yz_enabled),
                     "rearev_trm_halt_bce_weight": float(rearev_trm_halt_bce_weight),
                     "rearev_trm_ce_weight": float(rearev_trm_ce_weight),
                     "rearev_trm_weight": float(rearev_trm_weight),
@@ -2022,6 +2587,7 @@ def train_subgraph_reader(
                     "deep_supervision_weight": float(deep_supervision_weight),
                     "deep_supervision_ce_weight": float(deep_supervision_ce_weight),
                     "deep_supervision_halt_weight": float(deep_supervision_halt_weight),
+                    "kl_no_positive_mode": str(kl_no_positive_mode),
                     "grad_accum_steps": int(grad_accum_steps),
                 },
             }
@@ -2159,10 +2725,68 @@ def train_subgraph_reader(
                         step=ep * max(1, len(loader)),
                     )
 
+        should_stop = False
+        if early_stop_enabled and is_main:
+            cur_metric = None
+            if early_stop_metric == "train_loss":
+                cur_metric = float(mean_loss)
+            elif early_stop_metric == "dev_hit1":
+                cur_metric = None if dev_hit is None else float(dev_hit)
+            elif early_stop_metric == "dev_f1":
+                cur_metric = None if dev_f1 is None else float(dev_f1)
+
+            if cur_metric is None:
+                if local_ep >= early_stop_min_epochs:
+                    print(
+                        f"[EarlyStop] metric={early_stop_metric} unavailable at ep={ep} "
+                        f"(eval cadence). skip this epoch."
+                    )
+            else:
+                improved = False
+                if early_best_metric is None:
+                    improved = True
+                elif early_stop_metric == "train_loss":
+                    improved = (early_best_metric - cur_metric) > early_stop_min_delta
+                else:
+                    improved = (cur_metric - early_best_metric) > early_stop_min_delta
+
+                if improved:
+                    early_best_metric = float(cur_metric)
+                    early_bad_epochs = 0
+                elif local_ep >= early_stop_min_epochs:
+                    early_bad_epochs += 1
+
+                if wb is not None:
+                    wb.log(
+                        {
+                            "train/early_stop_metric_value": float(cur_metric),
+                            "train/early_stop_best_metric": float(early_best_metric),
+                            "train/early_stop_bad_epochs": int(early_bad_epochs),
+                            "train/epoch": int(ep),
+                        },
+                        step=ep * max(1, len(loader)),
+                    )
+
+                if local_ep >= early_stop_min_epochs and early_bad_epochs >= early_stop_patience:
+                    should_stop = True
+                    print(
+                        f"[EarlyStop] triggered at ep={ep} metric={early_stop_metric} "
+                        f"best={early_best_metric:.6f} current={cur_metric:.6f} "
+                        f"bad_epochs={early_bad_epochs} patience={early_stop_patience}"
+                    )
+
+        if is_ddp:
+            stop_buf = torch.tensor([1 if should_stop else 0], dtype=torch.int32, device=device)
+            dist.broadcast(stop_buf, src=0)
+            should_stop = bool(int(stop_buf.item()) == 1)
+
         if is_ddp:
             dist.barrier()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if should_stop:
+            break
 
 
 def test_subgraph_reader(args):
@@ -2298,6 +2922,27 @@ def test_subgraph_reader(args):
         ),
         default=True,
     )
+    rearev_trm_supervise_all_stages = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_trm_supervise_all_stages",
+            model_cfg.get("rearev_trm_supervise_all_stages", False),
+        )
+    )
+    rearev_act_stop_in_train = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_act_stop_in_train",
+            model_cfg.get("rearev_act_stop_in_train", False),
+        )
+    )
+    rearev_asymmetric_yz_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_asymmetric_yz_enabled",
+            model_cfg.get("rearev_asymmetric_yz_enabled", False),
+        )
+    )
 
     model = RecursiveSubgraphReader(
         entity_dim=ent_dim,
@@ -2323,6 +2968,9 @@ def test_subgraph_reader(args):
         rearev_trm_style_enabled=rearev_trm_style_enabled,
         rearev_trm_tminus1_no_grad=rearev_trm_tminus1_no_grad,
         rearev_trm_detach_carry=rearev_trm_detach_carry,
+        rearev_trm_supervise_all_stages=rearev_trm_supervise_all_stages,
+        rearev_act_stop_in_train=rearev_act_stop_in_train,
+        rearev_asymmetric_yz_enabled=rearev_asymmetric_yz_enabled,
     )
     sd = ckpt_obj.get("model_state", ckpt_obj) if isinstance(ckpt_obj, dict) else ckpt_obj
     skipped, missing = _safe_load_state_dict(model, sd)
@@ -2340,6 +2988,26 @@ def test_subgraph_reader(args):
         getattr(args, "subgraph_split_reverse_relations", sub_cfg.get("split_reverse_relations", False))
     )
     threshold = float(getattr(args, "subgraph_pred_threshold", sub_cfg.get("pred_threshold", 0.5)))
+    trace_rel_topk_enabled = _as_bool(
+        getattr(args, "subgraph_trace_relation_topk_enabled", False)
+    )
+    trace_rel_topk = max(1, int(getattr(args, "subgraph_trace_relation_topk", 5)))
+    trace_rel_log_examples = max(0, int(getattr(args, "subgraph_trace_log_examples", 5)))
+    trace_rel_dump_max_examples = max(
+        0, int(getattr(args, "subgraph_trace_dump_max_examples", 1000))
+    )
+    # Backward compatibility for older one-knob option.
+    legacy_trace_max = int(getattr(args, "subgraph_trace_max_examples", -1))
+    if (
+        legacy_trace_max >= 0
+        and trace_rel_log_examples == 5
+        and trace_rel_dump_max_examples == 1000
+    ):
+        trace_rel_log_examples = int(legacy_trace_max)
+        trace_rel_dump_max_examples = int(legacy_trace_max)
+    trace_path_dump_jsonl = str(getattr(args, "subgraph_trace_path_dump_jsonl", "")).strip()
+    relation_ids, relation_labels = _load_relation_text_labels(args.relations_txt)
+    entity_labels = _load_entity_text_labels(args.entities_txt)
 
     eval_ds = SubgraphExampleDataset(args.eval_json)
     eval_limit = int(getattr(args, "eval_limit", -1))
@@ -2414,6 +3082,27 @@ def test_subgraph_reader(args):
             f"[Test-Subgraph] Hit@1={hit:.4f} F1={f1:.4f} "
             f"Precision={precision:.4f} Recall={recall:.4f} Skip={skip}"
         )
+        trace_need_log = trace_rel_log_examples > 0
+        trace_need_dump = bool(trace_path_dump_jsonl) and trace_rel_dump_max_examples > 0
+        if trace_rel_topk_enabled and (trace_need_log or trace_need_dump):
+            if is_ddp:
+                print(
+                    "[Trace-RelTopK] DDP enabled: rank0 shard only. "
+                    "Run single-process test for full deterministic traces."
+                )
+            debug_relation_topk_trace(
+                model=model,
+                loader=eval_loader,
+                device=device,
+                relation_ids=relation_ids,
+                relation_labels=relation_labels,
+                entity_labels=entity_labels,
+                topk=trace_rel_topk,
+                log_examples=trace_rel_log_examples,
+                is_main=is_main,
+                path_dump_jsonl=trace_path_dump_jsonl,
+                dump_max_examples=trace_rel_dump_max_examples,
+            )
 
     if is_ddp:
         dist.barrier()

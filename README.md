@@ -47,6 +47,28 @@ Key knobs:
 - `subgraph_rearev_logit_global_fusion_enabled`
 - `subgraph_rearev_dynamic_halting_enabled`
 
+### Asymmetric Continuous Latent Recursion (`x,y,z`)
+
+For the requested TRM-style asymmetric loop, enable:
+
+- `subgraph_rearev_asymmetric_yz_enabled=true`
+
+Then one outer stage works as:
+
+1. Keep current answer state `y` fixed.
+2. Run inner ReaRev recursion multiple times to refine latent/memory state `z`:
+   - inner updates still use ReaRev relation-aware message passing.
+   - latent state is recurrently updated from graph context.
+3. After inner refinement finishes, update `y` **once** from `(y_prev, z_updated)`.
+
+Mapping to your notation:
+
+- `x`: question-conditioned instruction anchor (fixed problem context)
+- `y`: node-logit/distribution answer state
+- `z`: latent recurrent reasoning state
+
+So ReaRev remains the inner graph reasoner, and only the outer update schedule is asymmetric.
+
 ## 3) Loss Design (D Pipeline)
 
 ### Phase 1 (from scratch): `subgraph_loss_mode=rearev_kl`
@@ -54,6 +76,12 @@ Key knobs:
 Base objective:
 
 - `L = KL(target_node_distribution || predicted_node_distribution)`
+
+Important stability option:
+
+- `subgraph_kl_no_positive_mode=skip`
+  - if no positive node exists in the current row/subgraph, KL for that row is skipped
+  - avoids uniform-target over-regularization on no-positive rows
 
 Optional deep supervision (this repo addition):
 
@@ -172,6 +200,27 @@ PHASE1_SUBGRAPH_DEEP_SUPERVISION_HALT_WEIGHT=0.3 \
 PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
 PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
 PHASE1_SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA=0.25 \
+bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
+```
+
+### B-2) D+latent Asymmetric `y/z` (ReaRev inner, outer asymmetric update)
+
+```bash
+cd /data2/workspace/heewon/KGQA
+RUN_TAG=d_latent_asymyz_4gpu \
+WANDB_MODE=online \
+WANDB_PROJECT=graph-traverse \
+PRIMARY_GPUS=0,1,2,3 PRIMARY_NPROC=4 \
+FALLBACK_GPUS=0,1,2,3 FALLBACK_NPROC=4 \
+PHASE2_GPUS=0,1,2,3 PHASE2_NPROC_PER_NODE=4 \
+MASTER_PORT=29831 PHASE2_MASTER_PORT=29841 \
+EPOCHS=16 PHASE2_EPOCHS=5 \
+PHASE1_SUBGRAPH_LOSS_MODE=rearev_kl \
+PHASE1_SUBGRAPH_KL_NO_POSITIVE_MODE=skip \
+PHASE1_SUBGRAPH_REAREV_LATENT_REASONING_ENABLED=true \
+PHASE1_SUBGRAPH_REAREV_ASYMMETRIC_YZ_ENABLED=true \
+PHASE1_SUBGRAPH_REAREV_ACT_STOP_IN_TRAIN=true \
+PHASE1_SUBGRAPH_REAREV_TRM_SUPERVISE_ALL_STAGES=true \
 bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh
 ```
 
