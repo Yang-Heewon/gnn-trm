@@ -449,9 +449,6 @@ class RecursiveSubgraphReader(nn.Module):
         allowed_variants = {
             "rearev_bfs",
             "rearev_dplus",
-            "trm_rel_recursive",
-            "trm_frontier_recursive",
-            "trm_frontier_rearev1",
         }
         if variant not in allowed_variants:
             raise ValueError(
