@@ -140,6 +140,7 @@
   "wandb_project": "graph-traverse",
   "wandb_entity": "",
   "wandb_run_name": "",
+  "wandb_group": "",
   "wandb_mode": "online",
   "auto_test_after_train": true
 }

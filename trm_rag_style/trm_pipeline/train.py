@@ -238,6 +238,7 @@ def run(cfg):
         wandb_project=cfg.get('wandb_project', ''),
         wandb_entity=cfg.get('wandb_entity', ''),
         wandb_run_name=cfg.get('wandb_run_name', ''),
+        wandb_group=cfg.get('wandb_group', ''),
         wandb_mode=cfg.get('wandb_mode', 'disabled'),
         seed=int(cfg.get('seed', 42)),
         deterministic=_as_bool(cfg.get('deterministic', False)),

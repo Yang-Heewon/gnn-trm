@@ -17,6 +17,7 @@ Only D and D+ pipelines are supported.
 - `run_rearev_d_two_phase_auto.sh`: D phase1->best ckpt->phase2
 - `run_rearev_dplus_two_phase_auto.sh`: D+ phase1->best ckpt->phase2
 - `run_rearev_d_webqsp_two_phase_match_cwq.sh`: WebQSP two-phase launcher
+- `run_rearev_d_dplus_ablation_2datasets.sh`: 2-dataset paired ablation (D + D+, total 32 train stages)
 - `run_test.sh`: checkpoint test/eval
 
 ## Minimal run

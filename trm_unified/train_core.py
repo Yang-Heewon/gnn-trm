@@ -68,6 +68,7 @@ def _setup_wandb(args, is_main: bool):
         project=getattr(args, "wandb_project", None) or "graph-traverse",
         entity=getattr(args, "wandb_entity", None) or None,
         name=getattr(args, "wandb_run_name", None) or None,
+        group=getattr(args, "wandb_group", None) or None,
         mode=mode,
         config={
             "dataset": os.path.basename(getattr(args, "train_json", "")),

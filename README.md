@@ -12,6 +12,7 @@ All E/official and non-D/D+ launch paths were removed from this repo workflow.
 - `trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh`
 - `trm_rag_style/scripts/run_rearev_dplus_two_phase_auto.sh`
 - `trm_rag_style/scripts/run_rearev_d_webqsp_two_phase_match_cwq.sh`
+- `trm_rag_style/scripts/run_rearev_d_dplus_ablation_2datasets.sh`
 
 ## Quick start
 
@@ -25,4 +26,11 @@ D+ run:
 ```bash
 cd /data2/workspace/heewon/KGQA
 bash trm_rag_style/scripts/run_rearev_dplus_two_phase_auto.sh
+```
+
+32-stage ablation run (D and D+, cwq and webqsp, paired configs):
+
+```bash
+cd /data2/workspace/heewon/KGQA
+bash trm_rag_style/scripts/run_rearev_d_dplus_ablation_2datasets.sh
 ```

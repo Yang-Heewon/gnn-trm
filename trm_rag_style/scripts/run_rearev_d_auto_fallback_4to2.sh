@@ -15,7 +15,7 @@ LOG_DIR="${LOG_DIR:-logs/rearev_d_auto_fallback}"
 mkdir -p "$LOG_DIR"
 
 # Shared training knobs (can be overridden by env before launching this wrapper).
-export BATCH_SIZE="${BATCH_SIZE:-1}"
+export BATCH_SIZE="${BATCH_SIZE:-2}"
 export SUBGRAPH_GRAD_ACCUM_STEPS="${SUBGRAPH_GRAD_ACCUM_STEPS:-8}"
 export SUBGRAPH_MAX_NODES="${SUBGRAPH_MAX_NODES:-4096}"
 export SUBGRAPH_MAX_EDGES="${SUBGRAPH_MAX_EDGES:-16384}"

@@ -441,7 +441,7 @@ class RecursiveSubgraphReader(nn.Module):
         self.relation_dim = int(relation_dim)
         self.query_dim = int(query_dim)
         self.hidden_size = int(hidden_size)
-        self.recursion_steps = max(1, int(recursion_steps))
+        self.recursion_steps = max(0, int(recursion_steps))
         self.use_direction_embedding = bool(use_direction_embedding)
         self.outer_reasoning_enabled = bool(outer_reasoning_enabled)
         self.outer_reasoning_steps = max(1, int(outer_reasoning_steps))
@@ -2927,7 +2927,7 @@ def _load_model_from_ckpt_or_init(
             meta = obj
             model_cfg = obj.get("model_cfg", {})
             if isinstance(model_cfg, dict) and "recursion_steps" in model_cfg:
-                recursion_steps = max(1, int(model_cfg.get("recursion_steps", recursion_steps)))
+                recursion_steps = max(0, int(model_cfg.get("recursion_steps", recursion_steps)))
             if isinstance(model_cfg, dict) and "use_direction_embedding" in model_cfg:
                 use_direction_embedding = _as_bool(model_cfg.get("use_direction_embedding", False))
             if isinstance(model_cfg, dict) and "outer_reasoning_enabled" in model_cfg:
