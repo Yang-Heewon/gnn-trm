@@ -101,6 +101,9 @@ def run(cfg):
             cfg.get('subgraph_rearev_latent_reasoning_enabled', False)
         ),
         subgraph_rearev_latent_residual_alpha=float(cfg.get('subgraph_rearev_latent_residual_alpha', 0.25)),
+        subgraph_rearev_latent_update_mode=str(
+            cfg.get('subgraph_rearev_latent_update_mode', 'gru')
+        ),
         subgraph_rearev_global_gate_enabled=_as_bool(
             cfg.get('subgraph_rearev_global_gate_enabled', False)
         ),
@@ -133,6 +136,12 @@ def run(cfg):
         ),
         subgraph_rearev_asymmetric_yz_enabled=_as_bool(
             cfg.get('subgraph_rearev_asymmetric_yz_enabled', False)
+        ),
+        subgraph_rearev_asym_inner_y_ema_enabled=_as_bool(
+            cfg.get('subgraph_rearev_asym_inner_y_ema_enabled', False)
+        ),
+        subgraph_rearev_asym_inner_y_ema_alpha=float(
+            cfg.get('subgraph_rearev_asym_inner_y_ema_alpha', 0.0)
         ),
         subgraph_rearev_trm_halt_bce_weight=float(
             cfg.get('subgraph_rearev_trm_halt_bce_weight', 1.0)
@@ -167,6 +176,10 @@ def run(cfg):
         subgraph_direction_embedding_enabled=_as_bool(cfg.get('subgraph_direction_embedding_enabled', False)),
         subgraph_outer_reasoning_enabled=_as_bool(cfg.get('subgraph_outer_reasoning_enabled', False)),
         subgraph_outer_reasoning_steps=int(cfg.get('subgraph_outer_reasoning_steps', 3)),
+        subgraph_gnn_variant=str(cfg.get('subgraph_gnn_variant', 'rearev_bfs')),
+        subgraph_trm_rel_topk_relations=int(cfg.get('subgraph_trm_rel_topk_relations', 0)),
+        subgraph_trm_rel_score_alpha=float(cfg.get('subgraph_trm_rel_score_alpha', 1.0)),
+        subgraph_trm_rel_use_relid_policy=_as_bool(cfg.get('subgraph_trm_rel_use_relid_policy', True)),
         subgraph_ranking_enabled=_as_bool(cfg.get('subgraph_ranking_enabled', False)),
         subgraph_ranking_weight=float(cfg.get('subgraph_ranking_weight', 0.0)),
         subgraph_ranking_margin=float(cfg.get('subgraph_ranking_margin', 0.2)),
@@ -187,6 +200,21 @@ def run(cfg):
         subgraph_early_stop_patience=int(cfg.get('subgraph_early_stop_patience', 0)),
         subgraph_early_stop_min_delta=float(cfg.get('subgraph_early_stop_min_delta', 1e-4)),
         subgraph_early_stop_min_epochs=int(cfg.get('subgraph_early_stop_min_epochs', 1)),
+        subgraph_trace_supervision_enabled=_as_bool(
+            cfg.get('subgraph_trace_supervision_enabled', False)
+        ),
+        subgraph_trace_supervision_examples=int(
+            cfg.get('subgraph_trace_supervision_examples', 5)
+        ),
+        subgraph_trace_supervision_dump_jsonl=str(
+            cfg.get('subgraph_trace_supervision_dump_jsonl', '')
+        ),
+        subgraph_trace_supervision_plot_png=str(
+            cfg.get('subgraph_trace_supervision_plot_png', '')
+        ),
+        subgraph_ddp_find_unused_parameters=_as_bool(
+            cfg.get('subgraph_ddp_find_unused_parameters', cfg.get('ddp_find_unused', False))
+        ),
         subgraph_resume_epoch=int(cfg.get('subgraph_resume_epoch', -1)),
         train_min_path_hops=int(cfg.get('train_min_path_hops', 1)),
         freeze_lm_head=_as_bool(cfg.get('freeze_lm_head', True)),

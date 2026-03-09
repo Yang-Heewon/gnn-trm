@@ -1,9 +1,13 @@
-# Script Guide (ReaRev-Only Subgraph Reader)
+# Script Guide (ReaRev + TRM-Rel Subgraph Reader)
 
-This repository is now configured to run the **ReaRev-only** subgraph reader path.
+This repository supports both **ReaRev** and **TRM-style relation-recursive** subgraph readers.
 
 - `baseline` recurrence is disabled in code.
-- Subgraph variant is fixed to `rearev_bfs` during train/test.
+- Subgraph variant is selected by `SUBGRAPH_GNN_VARIANT`:
+  - `rearev_bfs` (default)
+  - `rearev_dplus` (D core + attention-memory latent update)
+  - `trm_rel_recursive` (tiny relation-aware recursive block)
+  - `trm_frontier_recursive` (frontier-transition recursive block; TRM-style final readout)
 - Recursion depth is controlled by `SUBGRAPH_RECURSION_STEPS`.
 
 ## Recursive ReaRev Summary
@@ -47,6 +51,15 @@ Phase objectives:
   - Two-phase D pipeline (phase1 convergence/early-stop -> best checkpoint -> phase2 fine-tune).
   - Supports phase2 best-ckpt selection (`PHASE2_BEST_METRIC=dev_hit1|dev_f1`) and optional latent ablation.
 
+- `run_trm_rel_recursive_phase1.sh`
+  - Phase1-only training for `trm_rel_recursive`.
+  - Default objective is `rearev_kl` + `final` supervision (no halt, no phase2).
+
+- `run_trm_frontier_recursive_phase1.sh`
+  - Phase1-only training for `trm_frontier_recursive`.
+  - Default objective is final-only KL (`rearev_kl`, `SUBGRAPH_KL_SUPERVISION_MODE=final`).
+  - Intermediate recursive steps are treated as transition states (not forced by step-uniform loss).
+
 - `run_rearev_d_latent_max_protocol.sh`
   - End-to-end latent-max protocol (phase1 latent-dominant + phase2 hit-focused) with multi-seed loop.
 
@@ -77,7 +90,10 @@ Phase objectives:
   - `SUBGRAPH_EARLY_STOP_ENABLED`, `SUBGRAPH_EARLY_STOP_METRIC`, `SUBGRAPH_EARLY_STOP_PATIENCE`
   - `SUBGRAPH_EARLY_STOP_MIN_DELTA`, `SUBGRAPH_EARLY_STOP_MIN_EPOCHS`
   - `SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA`
+  - `SUBGRAPH_REAREV_LATENT_UPDATE_MODE` (`gru` | `attn`)
   - `SUBGRAPH_KL_NO_POSITIVE_MODE` (`uniform` | `skip`)
+  - `SUBGRAPH_GNN_VARIANT` (`rearev_bfs` | `rearev_dplus` | `trm_rel_recursive` | `trm_frontier_recursive`)
+  - `SUBGRAPH_TRM_REL_TOPK_RELATIONS`, `SUBGRAPH_TRM_REL_SCORE_ALPHA`, `SUBGRAPH_TRM_REL_USE_RELID_POLICY`
 - Optimization:
   - `LR`, `SUBGRAPH_LR_SCHEDULER`, `SUBGRAPH_LR_MIN`
 - Test trace/debug:
@@ -96,6 +112,13 @@ bash trm_rag_style/scripts/run_rearev_d_auto_fallback_4to2.sh
 ```
 
 Then override env vars as needed.
+
+For D+ (attention-memory latent update):
+
+```bash
+cd /data2/workspace/heewon/KGQA
+bash trm_rag_style/scripts/run_rearev_dplus_two_phase_auto.sh
+```
 
 ## Quick Compare (D vs D+latent)
 

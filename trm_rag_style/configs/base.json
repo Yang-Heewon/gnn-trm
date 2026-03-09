@@ -93,6 +93,7 @@
   "subgraph_rearev_adapt_stages": 1,
   "subgraph_rearev_latent_reasoning_enabled": false,
   "subgraph_rearev_latent_residual_alpha": 0.25,
+  "subgraph_rearev_latent_update_mode": "gru",
   "subgraph_rearev_global_gate_enabled": false,
   "subgraph_rearev_logit_global_fusion_enabled": false,
   "subgraph_rearev_dynamic_halting_enabled": false,

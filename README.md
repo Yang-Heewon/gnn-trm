@@ -3,7 +3,7 @@
 This repo now supports two runnable experiment tracks:
 
 - Track A: **D baseline (2-phase)**
-- Track B: **Asymmetric y/z (phase1-only, KL+Halt)**
+- Track B: **Asymmetric y/z (phase1-only, final-only KL)**
 
 You can run each track separately, or run both sequentially.
 
@@ -71,8 +71,8 @@ Run only one mode through dual launcher:
 
 ### Track B: Asymmetric y/z (phase1-only)
 
-- Objective: `rearev_kl_halt`
-- KL supervision: `step_uniform`
+- Objective: `rearev_kl` (final-only KL)
+- KL supervision: `final`
 - Asymmetric update: `subgraph_rearev_asymmetric_yz_enabled=true`
 - No phase2 ranking/BCE-hardneg in default path
 - Script: `run_rearev_d_phase1_asym_only.sh`
@@ -93,7 +93,7 @@ Flow:
    - run inner ReaRev recursion `R` times (relation-aware forward/inverse message passing)
    - update `h`, `z`
    - update `y` once at stage end (asymmetric)
-4. Compute loss: `L_total = L_KL + w_halt * L_halt`
+4. Compute loss: `L_total = L_KL` (final stage only)
 5. Single backward per mini-batch: `L_total.backward()`
 
 Operation counts per sample:
@@ -106,9 +106,10 @@ Operation counts per sample:
 
 On startup `[SubgraphReader]` line for asym track, verify:
 
-- `loss_mode=rearev_kl_halt`
+- `loss_mode=rearev_kl`
 - `rearev_asym_yz=True`
-- `kl_sup=step_uniform`
+- `kl_sup=final`
+- `rearev_dyn_halt=False`
 
 For D baseline phase2, verify script log includes phase2 launch and `subgraph_loss_mode=bce`.
 

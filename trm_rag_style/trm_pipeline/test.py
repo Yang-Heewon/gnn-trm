@@ -54,6 +54,10 @@ def run(cfg):
         subgraph_direction_embedding_enabled=_as_bool(cfg.get('subgraph_direction_embedding_enabled', False)),
         subgraph_outer_reasoning_enabled=_as_bool(cfg.get('subgraph_outer_reasoning_enabled', False)),
         subgraph_outer_reasoning_steps=int(cfg.get('subgraph_outer_reasoning_steps', 3)),
+        subgraph_gnn_variant=str(cfg.get('subgraph_gnn_variant', 'rearev_bfs')),
+        subgraph_trm_rel_topk_relations=int(cfg.get('subgraph_trm_rel_topk_relations', 0)),
+        subgraph_trm_rel_score_alpha=float(cfg.get('subgraph_trm_rel_score_alpha', 1.0)),
+        subgraph_trm_rel_use_relid_policy=_as_bool(cfg.get('subgraph_trm_rel_use_relid_policy', True)),
         subgraph_recursion_steps=int(cfg.get('subgraph_recursion_steps', 8)),
         subgraph_rearev_num_ins=int(cfg.get('subgraph_rearev_num_ins', 3)),
         subgraph_rearev_adapt_stages=int(cfg.get('subgraph_rearev_adapt_stages', 1)),
@@ -62,6 +66,9 @@ def run(cfg):
             cfg.get('subgraph_rearev_latent_reasoning_enabled', False)
         ),
         subgraph_rearev_latent_residual_alpha=float(cfg.get('subgraph_rearev_latent_residual_alpha', 0.25)),
+        subgraph_rearev_latent_update_mode=str(
+            cfg.get('subgraph_rearev_latent_update_mode', 'gru')
+        ),
         subgraph_rearev_global_gate_enabled=_as_bool(
             cfg.get('subgraph_rearev_global_gate_enabled', False)
         ),
@@ -77,6 +84,15 @@ def run(cfg):
         subgraph_rearev_dynamic_halting_min_steps=int(
             cfg.get('subgraph_rearev_dynamic_halting_min_steps', 1)
         ),
+        subgraph_rearev_trm_style_enabled=_as_bool(
+            cfg.get('subgraph_rearev_trm_style_enabled', False)
+        ),
+        subgraph_rearev_trm_tminus1_no_grad=_as_bool(
+            cfg.get('subgraph_rearev_trm_tminus1_no_grad', True)
+        ),
+        subgraph_rearev_trm_detach_carry=_as_bool(
+            cfg.get('subgraph_rearev_trm_detach_carry', True)
+        ),
         subgraph_rearev_trm_supervise_all_stages=_as_bool(
             cfg.get('subgraph_rearev_trm_supervise_all_stages', False)
         ),
@@ -85,6 +101,12 @@ def run(cfg):
         ),
         subgraph_rearev_asymmetric_yz_enabled=_as_bool(
             cfg.get('subgraph_rearev_asymmetric_yz_enabled', False)
+        ),
+        subgraph_rearev_asym_inner_y_ema_enabled=_as_bool(
+            cfg.get('subgraph_rearev_asym_inner_y_ema_enabled', False)
+        ),
+        subgraph_rearev_asym_inner_y_ema_alpha=float(
+            cfg.get('subgraph_rearev_asym_inner_y_ema_alpha', 0.0)
         ),
         subgraph_trace_relation_topk_enabled=_as_bool(
             cfg.get('subgraph_trace_relation_topk_enabled', False)
@@ -103,6 +125,18 @@ def run(cfg):
         ),
         subgraph_trace_path_dump_jsonl=str(
             cfg.get('subgraph_trace_path_dump_jsonl', '')
+        ),
+        subgraph_trace_supervision_enabled=_as_bool(
+            cfg.get('subgraph_trace_supervision_enabled', False)
+        ),
+        subgraph_trace_supervision_examples=int(
+            cfg.get('subgraph_trace_supervision_examples', 5)
+        ),
+        subgraph_trace_supervision_dump_jsonl=str(
+            cfg.get('subgraph_trace_supervision_dump_jsonl', '')
+        ),
+        subgraph_trace_supervision_plot_png=str(
+            cfg.get('subgraph_trace_supervision_plot_png', '')
         ),
         subgraph_dropout=float(cfg.get('subgraph_dropout', 0.1)),
         subgraph_pred_threshold=float(cfg.get('subgraph_pred_threshold', 0.5)),

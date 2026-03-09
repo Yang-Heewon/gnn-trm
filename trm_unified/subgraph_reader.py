@@ -1,6 +1,8 @@
+import math
 import os
 import re
 import json
+from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -416,6 +418,7 @@ class RecursiveSubgraphReader(nn.Module):
         rearev_normalized_gnn: bool = False,
         rearev_latent_reasoning_enabled: bool = False,
         rearev_latent_residual_alpha: float = 0.25,
+        rearev_latent_update_mode: str = "gru",
         rearev_global_gate_enabled: bool = False,
         rearev_logit_global_fusion_enabled: bool = False,
         rearev_dynamic_halting_enabled: bool = False,
@@ -427,6 +430,11 @@ class RecursiveSubgraphReader(nn.Module):
         rearev_trm_supervise_all_stages: bool = False,
         rearev_act_stop_in_train: bool = False,
         rearev_asymmetric_yz_enabled: bool = False,
+        rearev_asym_inner_y_ema_enabled: bool = False,
+        rearev_asym_inner_y_ema_alpha: float = 0.0,
+        trm_rel_topk_relations: int = 0,
+        trm_rel_score_alpha: float = 1.0,
+        trm_rel_use_relid_policy: bool = True,
     ):
         super().__init__()
         self.entity_dim = int(entity_dim)
@@ -438,9 +446,16 @@ class RecursiveSubgraphReader(nn.Module):
         self.outer_reasoning_enabled = bool(outer_reasoning_enabled)
         self.outer_reasoning_steps = max(1, int(outer_reasoning_steps))
         variant = str(gnn_variant or "rearev_bfs").strip().lower()
-        if variant != "rearev_bfs":
+        allowed_variants = {
+            "rearev_bfs",
+            "rearev_dplus",
+            "trm_rel_recursive",
+            "trm_frontier_recursive",
+            "trm_frontier_rearev1",
+        }
+        if variant not in allowed_variants:
             raise ValueError(
-                f"Only rearev_bfs is supported in this build, got gnn_variant={variant!r}."
+                f"Unsupported gnn_variant={variant!r}. allowed={sorted(allowed_variants)}"
             )
         self.gnn_variant = variant
         self.rearev_num_instructions = max(1, int(rearev_num_instructions))
@@ -448,6 +463,15 @@ class RecursiveSubgraphReader(nn.Module):
         self.rearev_normalized_gnn = bool(rearev_normalized_gnn)
         self.rearev_latent_reasoning_enabled = bool(rearev_latent_reasoning_enabled)
         self.rearev_latent_residual_alpha = float(max(0.0, rearev_latent_residual_alpha))
+        latent_mode = str(rearev_latent_update_mode or "gru").strip().lower()
+        # D+ alias: same core operator as D(rearev_bfs), but uses attention-memory latent update.
+        if self.gnn_variant == "rearev_dplus" and latent_mode == "gru":
+            latent_mode = "attn"
+        if latent_mode not in {"gru", "attn"}:
+            raise ValueError(
+                f"Unsupported rearev_latent_update_mode={latent_mode!r}. allowed=['gru','attn']"
+            )
+        self.rearev_latent_update_mode = latent_mode
         self.rearev_global_gate_enabled = bool(rearev_global_gate_enabled)
         self.rearev_logit_global_fusion_enabled = bool(rearev_logit_global_fusion_enabled)
         self.rearev_dynamic_halting_enabled = bool(rearev_dynamic_halting_enabled)
@@ -461,6 +485,13 @@ class RecursiveSubgraphReader(nn.Module):
         self.rearev_trm_supervise_all_stages = bool(rearev_trm_supervise_all_stages)
         self.rearev_act_stop_in_train = bool(rearev_act_stop_in_train)
         self.rearev_asymmetric_yz_enabled = bool(rearev_asymmetric_yz_enabled)
+        self.rearev_asym_inner_y_ema_enabled = bool(rearev_asym_inner_y_ema_enabled)
+        self.rearev_asym_inner_y_ema_alpha = float(
+            min(1.0, max(0.0, rearev_asym_inner_y_ema_alpha))
+        )
+        self.trm_rel_topk_relations = max(0, int(trm_rel_topk_relations))
+        self.trm_rel_score_alpha = float(max(0.0, trm_rel_score_alpha))
+        self.trm_rel_use_relid_policy = bool(trm_rel_use_relid_policy)
 
         self.node_proj = nn.Linear(self.entity_dim, self.hidden_size)
         self.rel_proj = nn.Linear(self.relation_dim, self.hidden_size)
@@ -502,8 +533,14 @@ class RecursiveSubgraphReader(nn.Module):
             )
         else:
             self.rearev_score_fusion = None
+        self.rearev_latent_gru = None
+        self.rearev_latent_norm = None
+        self.rearev_latent_to_ins = None
+        self.rearev_latent_attn_q_proj = None
+        self.rearev_latent_attn_k_proj = None
+        self.rearev_latent_attn_v_proj = None
+        self.rearev_latent_attn_gate = None
         if self.rearev_latent_reasoning_enabled:
-            self.rearev_latent_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
             self.rearev_latent_norm = nn.LayerNorm(self.hidden_size)
             self.rearev_latent_to_ins = nn.Linear(
                 self.hidden_size,
@@ -512,10 +549,13 @@ class RecursiveSubgraphReader(nn.Module):
             # Zero-init keeps step-0 behavior equivalent to vanilla ReaRev, then learns deltas.
             nn.init.zeros_(self.rearev_latent_to_ins.weight)
             nn.init.zeros_(self.rearev_latent_to_ins.bias)
-        else:
-            self.rearev_latent_gru = None
-            self.rearev_latent_norm = None
-            self.rearev_latent_to_ins = None
+            if self.rearev_latent_update_mode == "gru":
+                self.rearev_latent_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
+            elif self.rearev_latent_update_mode == "attn":
+                self.rearev_latent_attn_q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+                self.rearev_latent_attn_k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+                self.rearev_latent_attn_v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+                self.rearev_latent_attn_gate = nn.Linear(self.hidden_size * 2, 1)
         if self.rearev_dynamic_halting_enabled or self.rearev_trm_style_enabled:
             self.rearev_halt_proj = nn.Linear(self.hidden_size, 1)
         else:
@@ -543,6 +583,24 @@ class RecursiveSubgraphReader(nn.Module):
             self.outer_state_norm = nn.LayerNorm(self.hidden_size)
         if self.use_direction_embedding:
             self.edge_dir_emb = nn.Embedding(2, self.hidden_size)
+        if self.gnn_variant in {"trm_rel_recursive", "trm_frontier_recursive", "trm_frontier_rearev1"}:
+            self.trm_rel_query_proj = nn.Linear(self.hidden_size * 2, self.hidden_size)
+            self.trm_rel_score_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+            self.trm_rel_gate_proj = nn.Linear(self.hidden_size, self.hidden_size)
+            self.trm_rel_node_update = nn.Linear(self.hidden_size * 2, self.hidden_size)
+            self.trm_rel_h_norm = nn.LayerNorm(self.hidden_size)
+            self.trm_rel_y_update_gate = nn.Linear(self.hidden_size * 3, 1)
+            self.trm_rel_z_gru = nn.GRUCell(self.hidden_size, self.hidden_size)
+            self.trm_rel_z_norm = nn.LayerNorm(self.hidden_size)
+        else:
+            self.trm_rel_query_proj = None
+            self.trm_rel_score_proj = None
+            self.trm_rel_gate_proj = None
+            self.trm_rel_node_update = None
+            self.trm_rel_h_norm = None
+            self.trm_rel_y_update_gate = None
+            self.trm_rel_z_gru = None
+            self.trm_rel_z_norm = None
 
     def _score_nodes(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         base_score = self.out_head(self.dropout(h)).squeeze(-1)
@@ -610,6 +668,86 @@ class RecursiveSubgraphReader(nn.Module):
         deg.index_add_(0, src, torch.ones((e,), dtype=dtype, device=device))
         return 1.0 / deg[src].clamp(min=1.0)
 
+    def _safe_prob_normalize(
+        self,
+        x: torch.Tensor,
+        *,
+        fallback: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        # Avoid exploding gradients from division by near-zero probability mass.
+        if x.numel() <= 0:
+            return x
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        total = x.sum()
+        if float(total.detach().item()) > float(eps):
+            out = x / total
+            return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if fallback is not None and fallback.numel() == x.numel():
+            fb = torch.nan_to_num(fallback, nan=0.0, posinf=0.0, neginf=0.0)
+            fb_total = fb.sum()
+            if float(fb_total.detach().item()) > float(eps):
+                return fb / fb_total
+        # Final fallback: put all mass on a deterministic index to keep the graph alive.
+        out = torch.zeros_like(x)
+        out.view(-1)[0] = 1.0
+        return out
+
+    def _update_latent_state(
+        self,
+        prev_latent: torch.Tensor,
+        h_state: torch.Tensor,
+        node_dist: Optional[torch.Tensor],
+        *,
+        use_plain_context: bool = False,
+    ) -> torch.Tensor:
+        if not self.rearev_latent_reasoning_enabled:
+            return prev_latent
+        if int(h_state.shape[0]) <= 0:
+            return prev_latent
+        if self.rearev_latent_norm is None:
+            return prev_latent
+
+        if self.rearev_latent_update_mode == "gru":
+            if self.rearev_latent_gru is None:
+                return prev_latent
+            if use_plain_context:
+                ctx = h_state.mean(dim=0)
+            elif node_dist is not None and int(node_dist.numel()) == int(h_state.shape[0]):
+                prob = self._safe_prob_normalize(node_dist, eps=1e-8)
+                ctx = (h_state * prob.unsqueeze(-1)).sum(dim=0)
+            else:
+                ctx = h_state.mean(dim=0)
+            latent = self.rearev_latent_gru(
+                ctx.unsqueeze(0),
+                prev_latent.unsqueeze(0),
+            ).squeeze(0)
+            return self.rearev_latent_norm(latent)
+
+        if self.rearev_latent_update_mode == "attn":
+            if (
+                self.rearev_latent_attn_q_proj is None
+                or self.rearev_latent_attn_k_proj is None
+                or self.rearev_latent_attn_v_proj is None
+                or self.rearev_latent_attn_gate is None
+            ):
+                return prev_latent
+            q = self.rearev_latent_attn_q_proj(prev_latent).unsqueeze(0)  # [1, d]
+            k = self.rearev_latent_attn_k_proj(h_state)  # [n, d]
+            v = self.rearev_latent_attn_v_proj(h_state)  # [n, d]
+            logits = (k * q).sum(dim=-1) / math.sqrt(float(max(1, self.hidden_size)))
+            if (not use_plain_context) and node_dist is not None and int(node_dist.numel()) == int(h_state.shape[0]):
+                prob = self._safe_prob_normalize(node_dist, eps=1e-8).clamp(min=1e-8)
+                logits = logits + torch.log(prob)
+            attn = torch.softmax(logits, dim=0)
+            ctx = (v * attn.unsqueeze(-1)).sum(dim=0)
+            gate_in = torch.cat([prev_latent, ctx], dim=-1).unsqueeze(0)
+            beta = torch.sigmoid(self.rearev_latent_attn_gate(gate_in)).view(())
+            latent = (1.0 - beta) * prev_latent + beta * ctx
+            return self.rearev_latent_norm(latent)
+
+        return prev_latent
+
     def _reason_layer_pair(
         self,
         curr_dist: torch.Tensor,
@@ -652,6 +790,435 @@ class RecursiveSubgraphReader(nn.Module):
             )
         return agg_fwd, agg_inv, edge_strength
 
+    def _trm_rel_edge_policy(
+        self,
+        z: torch.Tensor,
+        q_state: torch.Tensor,
+        rel_h: Optional[torch.Tensor],
+        edge_rel_ids: Optional[torch.Tensor],
+        e: int,
+        ref_h: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            e <= 0
+            or rel_h is None
+            or self.trm_rel_query_proj is None
+            or self.trm_rel_score_proj is None
+        ):
+            return torch.zeros((max(0, e),), dtype=ref_h.dtype, device=ref_h.device)
+
+        zq = torch.cat([z, q_state], dim=-1).unsqueeze(0)
+        rel_query = torch.tanh(self.trm_rel_query_proj(zq)).squeeze(0)
+        rel_query = self.trm_rel_score_proj(rel_query)
+        edge_raw = (rel_h * rel_query.unsqueeze(0)).sum(dim=-1)
+        edge_raw = torch.nan_to_num(edge_raw, nan=0.0, posinf=20.0, neginf=-20.0).clamp(
+            min=-20.0, max=20.0
+        )
+
+        if (
+            self.trm_rel_use_relid_policy
+            and edge_rel_ids is not None
+            and int(edge_rel_ids.numel()) >= e
+            and bool((edge_rel_ids[:e] >= 0).any().item())
+        ):
+            rel_ids = edge_rel_ids[:e].to(torch.long)
+            valid = rel_ids >= 0
+            rel_ids_valid = rel_ids[valid]
+            edge_raw_valid = edge_raw[valid]
+            uniq_rel, inv = torch.unique(
+                rel_ids_valid, sorted=False, return_inverse=True
+            )
+            rel_sum = edge_raw.new_zeros((int(uniq_rel.numel()),))
+            rel_cnt = edge_raw.new_zeros((int(uniq_rel.numel()),))
+            rel_sum.index_add_(0, inv, edge_raw_valid)
+            rel_cnt.index_add_(0, inv, torch.ones_like(edge_raw_valid))
+            rel_scores = rel_sum / rel_cnt.clamp(min=1.0)
+            rel_scores = torch.nan_to_num(
+                rel_scores, nan=0.0, posinf=20.0, neginf=-20.0
+            ).clamp(min=-20.0, max=20.0)
+            if 0 < self.trm_rel_topk_relations < int(rel_scores.numel()):
+                kk = int(self.trm_rel_topk_relations)
+                _, topi = torch.topk(rel_scores, k=kk, largest=True)
+                masked = torch.full_like(rel_scores, -1e9)
+                masked[topi] = rel_scores[topi]
+                rel_scores = masked
+            rel_policy = torch.softmax(rel_scores, dim=0)
+            rel_policy = self._safe_prob_normalize(rel_policy, eps=1e-8)
+            edge_w = edge_raw.new_zeros((e,))
+            edge_w[valid] = rel_policy[inv]
+        else:
+            edge_w = torch.softmax(edge_raw, dim=0)
+            if 0 < self.trm_rel_topk_relations < e:
+                kk = int(self.trm_rel_topk_relations)
+                topv, topi = torch.topk(edge_w, k=kk, largest=True)
+                sparse = torch.zeros_like(edge_w)
+                sparse[topi] = topv
+                edge_w = self._safe_prob_normalize(sparse, eps=1e-8)
+            else:
+                edge_w = self._safe_prob_normalize(edge_w, eps=1e-8)
+        return edge_w
+
+    def _inner_recur_trm_rel(
+        self,
+        h: torch.Tensor,
+        src: Optional[torch.Tensor],
+        dst: Optional[torch.Tensor],
+        rel_h: Optional[torch.Tensor],
+        rel_h_inv: Optional[torch.Tensor],
+        edge_rel_ids: Optional[torch.Tensor],
+        q_inj: torch.Tensor,
+        seed_mask: Optional[torch.Tensor],
+        n: int,
+        e: int,
+        return_rel_trace: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        del rel_h_inv  # not used in this variant
+        q_state = q_inj.squeeze(0)
+        h_state = h
+        z_state = q_state
+        y_state = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
+        score_tp = torch.log(y_state.clamp(min=1e-8))
+
+        trm_step_logits: List[torch.Tensor] = []
+        trm_step_halt_logits: List[torch.Tensor] = []
+        trm_step_valid: List[torch.Tensor] = []
+        trace_step_logits: List[torch.Tensor] = []
+        trace_step_edge_importance: List[torch.Tensor] = []
+
+        outer_should_break = False
+        for stage_idx in range(self.rearev_adapt_stages):
+            for step_idx in range(self.recursion_steps):
+                edge_w = self._trm_rel_edge_policy(
+                    z=z_state,
+                    q_state=q_state,
+                    rel_h=rel_h,
+                    edge_rel_ids=edge_rel_ids,
+                    e=e,
+                    ref_h=h_state,
+                )
+
+                if e > 0 and src is not None and dst is not None:
+                    y_src = y_state[src]
+                    y_msg = y_src * edge_w
+                    y_prop = y_state.new_zeros((n,))
+                    y_prop.index_add_(0, dst, y_msg)
+                    y_prop = self._safe_prob_normalize(y_prop, fallback=y_state, eps=1e-6)
+                else:
+                    y_prop = y_state
+
+                if (
+                    e > 0
+                    and src is not None
+                    and dst is not None
+                    and rel_h is not None
+                    and self.trm_rel_gate_proj is not None
+                ):
+                    h_src = h_state[src]
+                    rel_gate = torch.sigmoid(self.trm_rel_gate_proj(self.dropout(rel_h)))
+                    node_msg = h_src * rel_gate * edge_w.unsqueeze(-1)
+                    agg = h_state.new_zeros((n, self.hidden_size))
+                    agg.index_add_(0, dst, node_msg)
+                else:
+                    agg = h_state.new_zeros((n, self.hidden_size))
+
+                if self.trm_rel_node_update is None or self.trm_rel_h_norm is None:
+                    raise RuntimeError("trm_rel_recursive modules are not initialized.")
+                delta_h = torch.tanh(
+                    self.trm_rel_node_update(self.dropout(torch.cat([h_state, agg], dim=-1)))
+                )
+                h_candidate = self.trm_rel_h_norm(h_state + self.dropout(delta_h))
+
+                if self.trm_rel_z_gru is None or self.trm_rel_z_norm is None:
+                    raise RuntimeError("trm_rel_recursive latent modules are not initialized.")
+                summary = (h_candidate * y_prop.unsqueeze(-1)).sum(dim=0)
+                z_candidate = self.trm_rel_z_gru(
+                    summary.unsqueeze(0), z_state.unsqueeze(0)
+                ).squeeze(0)
+                z_candidate = self.trm_rel_z_norm(z_candidate)
+
+                if self.trm_rel_y_update_gate is None:
+                    raise RuntimeError("trm_rel_recursive y-update modules are not initialized.")
+                z_expand = z_candidate.unsqueeze(0).expand(n, -1)
+                q_expand = q_state.unsqueeze(0).expand(n, -1)
+                beta_in = torch.cat([h_candidate, z_expand, h_candidate * q_expand], dim=-1)
+                beta = torch.sigmoid(self.trm_rel_y_update_gate(self.dropout(beta_in))).squeeze(-1)
+                y_next = (1.0 - beta) * y_state + beta * y_prop
+                y_next = self._safe_prob_normalize(y_next, fallback=y_state, eps=1e-6)
+
+                score_base = self._score_nodes(h_candidate, z_candidate)
+                score_tp = score_base + (self.trm_rel_score_alpha * torch.log(y_next.clamp(min=1e-8)))
+                y_state = torch.softmax(score_tp, dim=0)
+                h_state = h_candidate
+                z_state = z_candidate
+
+                halt_logit = self._halt_logit(z_state, h_state, y_state)
+                if self.rearev_trm_style_enabled and (
+                    self.rearev_trm_supervise_all_stages
+                    or ((stage_idx + 1) >= self.rearev_adapt_stages)
+                ):
+                    trm_step_logits.append(score_tp)
+                    trm_step_halt_logits.append(halt_logit)
+                    trm_step_valid.append(torch.ones((), dtype=torch.bool, device=score_tp.device))
+
+                if self.rearev_dynamic_halting_enabled and (
+                    (not self.training) or self.rearev_act_stop_in_train
+                ):
+                    if (
+                        (step_idx + 1) >= self.rearev_dynamic_halting_min_steps
+                        and float(torch.sigmoid(halt_logit).detach().item())
+                        >= self.rearev_dynamic_halting_threshold
+                    ):
+                        outer_should_break = True
+
+                if return_rel_trace:
+                    trace_step_logits.append(score_tp)
+                    if e > 0:
+                        trace_step_edge_importance.append(edge_w)
+                    else:
+                        trace_step_edge_importance.append(
+                            score_tp.new_zeros((0,), dtype=score_tp.dtype, device=score_tp.device)
+                        )
+
+                if outer_should_break:
+                    break
+            if outer_should_break:
+                break
+
+        trm_aux = None
+        if self.rearev_trm_style_enabled or return_rel_trace:
+            trm_aux = {}
+            if self.rearev_trm_style_enabled:
+                if trm_step_logits:
+                    trm_aux["step_logits"] = torch.stack(trm_step_logits, dim=0)
+                    trm_aux["step_halt_logits"] = torch.stack(trm_step_halt_logits, dim=0)
+                    trm_aux["step_valid_mask"] = torch.stack(trm_step_valid, dim=0)
+                else:
+                    trm_aux["step_logits"] = score_tp.new_full((0, n), -1e4)
+                    trm_aux["step_halt_logits"] = score_tp.new_zeros((0,))
+                    trm_aux["step_valid_mask"] = torch.zeros(
+                        (0,), dtype=torch.bool, device=score_tp.device
+                    )
+            if return_rel_trace:
+                if trace_step_logits:
+                    trm_aux["trace_step_logits"] = torch.stack(trace_step_logits, dim=0)
+                    trm_aux["trace_step_edge_importance"] = torch.stack(
+                        trace_step_edge_importance, dim=0
+                    )
+                else:
+                    trm_aux["trace_step_logits"] = score_tp.new_full((0, n), -1e4)
+                    trm_aux["trace_step_edge_importance"] = score_tp.new_zeros((0, e))
+                if edge_rel_ids is None or int(edge_rel_ids.numel()) <= 0:
+                    trm_aux["trace_edge_rel_ids"] = score_tp.new_full((e,), -1, dtype=torch.long)
+                else:
+                    trm_aux["trace_edge_rel_ids"] = edge_rel_ids[:e].to(dtype=torch.long)
+
+        return h_state, score_tp, trm_aux
+
+    def _inner_recur_trm_frontier(
+        self,
+        h: torch.Tensor,
+        src: Optional[torch.Tensor],
+        dst: Optional[torch.Tensor],
+        rel_h: Optional[torch.Tensor],
+        rel_h_inv: Optional[torch.Tensor],
+        edge_rel_ids: Optional[torch.Tensor],
+        q_inj: torch.Tensor,
+        seed_mask: Optional[torch.Tensor],
+        n: int,
+        e: int,
+        return_rel_trace: bool = False,
+        use_rearev1_operator: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        # Frontier-recursive mode:
+        # step core is transition/control over y (frontier), and final readout happens at the end.
+        q_state = q_inj.squeeze(0)
+        h_state = h
+        z_state = q_state
+        y_state = self._seed_distribution(seed_mask=seed_mask, n=n, dtype=h.dtype, device=h.device)
+        score_tp = torch.log(y_state.clamp(min=1e-8))
+
+        trm_step_logits: List[torch.Tensor] = []
+        trm_step_halt_logits: List[torch.Tensor] = []
+        trm_step_valid: List[torch.Tensor] = []
+        trace_step_logits: List[torch.Tensor] = []
+        trace_step_edge_importance: List[torch.Tensor] = []
+        frontier_step_score_raw: List[torch.Tensor] = []
+        frontier_step_score_frontier: List[torch.Tensor] = []
+        frontier_step_y_dist: List[torch.Tensor] = []
+        frontier_step_y_entropy: List[torch.Tensor] = []
+
+        for step_idx in range(self.recursion_steps):
+            edge_w = self._trm_rel_edge_policy(
+                z=z_state,
+                q_state=q_state,
+                rel_h=rel_h,
+                edge_rel_ids=edge_rel_ids,
+                e=e,
+                ref_h=h_state,
+            )
+
+            if e > 0 and src is not None and dst is not None:
+                y_src = y_state[src]
+                y_msg = y_src * edge_w
+                y_prop = y_state.new_zeros((n,))
+                y_prop.index_add_(0, dst, y_msg)
+                y_prop = self._safe_prob_normalize(y_prop, fallback=y_state, eps=1e-6)
+            else:
+                y_prop = y_state
+
+            if use_rearev1_operator:
+                # ReaRev 1-step operator:
+                # use relation-aware forward/inverse propagation and collapse to one message tensor.
+                instruction = torch.tanh(q_state + z_state)
+                if self.rearev_ins_proj is not None:
+                    ins_all = self.rearev_ins_proj(instruction).view(
+                        self.rearev_num_instructions, self.hidden_size
+                    )
+                    instruction = ins_all[0]
+                rel_linear = self.rearev_rel_linears[step_idx % len(self.rearev_rel_linears)]
+                agg_fwd, agg_inv, _ = self._reason_layer_pair(
+                    curr_dist=y_state,
+                    instruction=instruction,
+                    rel_linear=rel_linear,
+                    rel_h=rel_h,
+                    rel_h_inv=rel_h_inv,
+                    src=src,
+                    dst=dst,
+                    edge_w=edge_w if e > 0 else None,
+                    n=n,
+                    e=e,
+                    ref_h=h_state,
+                    return_edge_strength=False,
+                )
+                agg = 0.5 * (agg_fwd + agg_inv)
+            elif (
+                e > 0
+                and src is not None
+                and dst is not None
+                and rel_h is not None
+                and self.trm_rel_gate_proj is not None
+            ):
+                h_src = h_state[src]
+                rel_gate = torch.sigmoid(self.trm_rel_gate_proj(self.dropout(rel_h)))
+                node_msg = h_src * rel_gate * edge_w.unsqueeze(-1)
+                agg = h_state.new_zeros((n, self.hidden_size))
+                agg.index_add_(0, dst, node_msg)
+            else:
+                agg = h_state.new_zeros((n, self.hidden_size))
+
+            if self.trm_rel_node_update is None or self.trm_rel_h_norm is None:
+                raise RuntimeError("trm_frontier_recursive modules are not initialized.")
+            delta_h = torch.tanh(
+                self.trm_rel_node_update(self.dropout(torch.cat([h_state, agg], dim=-1)))
+            )
+            h_candidate = self.trm_rel_h_norm(h_state + self.dropout(delta_h))
+
+            if self.trm_rel_z_gru is None or self.trm_rel_z_norm is None:
+                raise RuntimeError("trm_frontier_recursive latent modules are not initialized.")
+            summary = (h_candidate * y_prop.unsqueeze(-1)).sum(dim=0)
+            z_candidate = self.trm_rel_z_gru(
+                summary.unsqueeze(0), z_state.unsqueeze(0)
+            ).squeeze(0)
+            z_candidate = self.trm_rel_z_norm(z_candidate)
+
+            if self.trm_rel_y_update_gate is None:
+                raise RuntimeError("trm_frontier_recursive y-update modules are not initialized.")
+            z_expand = z_candidate.unsqueeze(0).expand(n, -1)
+            q_expand = q_state.unsqueeze(0).expand(n, -1)
+            beta_in = torch.cat([h_candidate, z_expand, h_candidate * q_expand], dim=-1)
+            beta = torch.sigmoid(self.trm_rel_y_update_gate(self.dropout(beta_in))).squeeze(-1)
+            y_next = (1.0 - beta) * y_state + beta * y_prop
+            y_next = self._safe_prob_normalize(y_next, fallback=y_state, eps=1e-6)
+
+            score_base = self._score_nodes(h_candidate, z_candidate)
+            # Keep frontier term bounded so it does not numerically dominate score_base.
+            frontier_log = torch.log(y_next.clamp(min=1e-8)).clamp(min=-8.0, max=0.0)
+            score_frontier = self.trm_rel_score_alpha * frontier_log
+            score_tp = score_base + score_frontier
+
+            # Frontier semantics: carry frontier state directly, not via softmax(score_tp).
+            y_state = y_next
+            h_state = h_candidate
+            z_state = z_candidate
+            frontier_step_score_raw.append(score_base)
+            frontier_step_score_frontier.append(score_frontier)
+            frontier_step_y_dist.append(y_state)
+            y_entropy = -(y_state * torch.log(y_state.clamp(min=1e-12))).sum()
+            frontier_step_y_entropy.append(y_entropy)
+
+            halt_logit = self._halt_logit(z_state, h_state, y_state)
+            trm_step_logits.append(score_tp)
+            trm_step_halt_logits.append(halt_logit)
+            trm_step_valid.append(torch.ones((), dtype=torch.bool, device=score_tp.device))
+            if (
+                self.rearev_trm_style_enabled
+                and self.training
+                and self.rearev_trm_detach_carry
+                and ((step_idx + 1) < self.recursion_steps)
+            ):
+                h_state = h_state.detach()
+                z_state = z_state.detach()
+                y_state = y_state.detach()
+                score_tp = score_tp.detach()
+
+            if return_rel_trace:
+                trace_step_logits.append(score_tp)
+                if e > 0:
+                    trace_step_edge_importance.append(edge_w)
+                else:
+                    trace_step_edge_importance.append(
+                        score_tp.new_zeros((0,), dtype=score_tp.dtype, device=score_tp.device)
+                    )
+
+            if self.rearev_dynamic_halting_enabled and (
+                (not self.training) or self.rearev_act_stop_in_train
+            ):
+                if (
+                    (step_idx + 1) >= self.rearev_dynamic_halting_min_steps
+                    and float(torch.sigmoid(halt_logit).detach().item())
+                    >= self.rearev_dynamic_halting_threshold
+                ):
+                    break
+
+        trm_aux = None
+        if self.gnn_variant in {"trm_frontier_recursive", "trm_frontier_rearev1"} or self.rearev_trm_style_enabled or return_rel_trace:
+            trm_aux = {}
+            if trm_step_logits:
+                trm_aux["step_logits"] = torch.stack(trm_step_logits, dim=0)
+                trm_aux["step_halt_logits"] = torch.stack(trm_step_halt_logits, dim=0)
+                trm_aux["step_valid_mask"] = torch.stack(trm_step_valid, dim=0)
+            else:
+                trm_aux["step_logits"] = score_tp.new_full((0, n), -1e4)
+                trm_aux["step_halt_logits"] = score_tp.new_zeros((0,))
+                trm_aux["step_valid_mask"] = torch.zeros(
+                    (0,), dtype=torch.bool, device=score_tp.device
+                )
+            if frontier_step_score_raw:
+                trm_aux["frontier_step_score_raw"] = torch.stack(frontier_step_score_raw, dim=0)
+                trm_aux["frontier_step_score_frontier"] = torch.stack(frontier_step_score_frontier, dim=0)
+                trm_aux["frontier_step_y_dist"] = torch.stack(frontier_step_y_dist, dim=0)
+                trm_aux["frontier_step_y_entropy"] = torch.stack(frontier_step_y_entropy, dim=0)
+            else:
+                trm_aux["frontier_step_score_raw"] = score_tp.new_full((0, n), 0.0)
+                trm_aux["frontier_step_score_frontier"] = score_tp.new_full((0, n), 0.0)
+                trm_aux["frontier_step_y_dist"] = score_tp.new_full((0, n), 0.0)
+                trm_aux["frontier_step_y_entropy"] = score_tp.new_zeros((0,))
+            if return_rel_trace:
+                if trace_step_logits:
+                    trm_aux["trace_step_logits"] = torch.stack(trace_step_logits, dim=0)
+                    trm_aux["trace_step_edge_importance"] = torch.stack(
+                        trace_step_edge_importance, dim=0
+                    )
+                else:
+                    trm_aux["trace_step_logits"] = score_tp.new_full((0, n), -1e4)
+                    trm_aux["trace_step_edge_importance"] = score_tp.new_zeros((0, e))
+                if edge_rel_ids is None or int(edge_rel_ids.numel()) <= 0:
+                    trm_aux["trace_edge_rel_ids"] = score_tp.new_full((e,), -1, dtype=torch.long)
+                else:
+                    trm_aux["trace_edge_rel_ids"] = edge_rel_ids[:e].to(dtype=torch.long)
+
+        return h_state, score_tp, trm_aux
+
     def _inner_recur_rearev(
         self,
         h: torch.Tensor,
@@ -692,12 +1259,14 @@ class RecursiveSubgraphReader(nn.Module):
         for stage_idx in range(self.rearev_adapt_stages):
             y_prev_score = score_tp
             y_prev_dist = curr_dist
+            y_inner_score = y_prev_score
+            y_inner_dist = y_prev_dist
             halt_mass = 0.0
             alive_prob = h_stage.new_tensor(1.0)
             for step_idx in range(self.recursion_steps):
                 rel_linear = self.rearev_rel_linears[step_idx]
                 e2e_linear = self.rearev_e2e_linears[step_idx]
-                reason_dist = y_prev_dist if self.rearev_asymmetric_yz_enabled else curr_dist
+                reason_dist = y_inner_dist if self.rearev_asymmetric_yz_enabled else curr_dist
                 step_instructions = instructions
                 if self.rearev_latent_reasoning_enabled and self.rearev_latent_to_ins is not None:
                     ins_delta = self.rearev_latent_to_ins(latent_state).view(
@@ -764,19 +1333,14 @@ class RecursiveSubgraphReader(nn.Module):
                     latent_candidate = prev_latent
                     if (
                         self.rearev_latent_reasoning_enabled
-                        and self.rearev_latent_gru is not None
-                        and self.rearev_latent_norm is not None
                     ):
-                        if self.rearev_asymmetric_yz_enabled:
-                            # In asymmetric mode, z-refinement does not depend on new y; use plain context.
-                            ctx = h_candidate.mean(dim=0)
-                        else:
-                            ctx = (h_candidate * dist_candidate.unsqueeze(-1)).sum(dim=0)
-                        latent_candidate = self.rearev_latent_gru(
-                            ctx.unsqueeze(0),
-                            prev_latent.unsqueeze(0),
-                        ).squeeze(0)
-                        latent_candidate = self.rearev_latent_norm(latent_candidate)
+                        # D: GRU latent memory, D+: attention-memory latent update.
+                        latent_candidate = self._update_latent_state(
+                            prev_latent=prev_latent,
+                            h_state=h_candidate,
+                            node_dist=None if self.rearev_asymmetric_yz_enabled else dist_candidate,
+                            use_plain_context=bool(self.rearev_asymmetric_yz_enabled),
+                        )
                     if self.rearev_dynamic_halting_enabled and (not self.rearev_asymmetric_yz_enabled):
                         alive_before = alive_prob
                         p_halt = h_stage.new_tensor(0.0)
@@ -806,8 +1370,16 @@ class RecursiveSubgraphReader(nn.Module):
                     else:
                         h_stage = h_candidate
                         if self.rearev_asymmetric_yz_enabled:
-                            score_tp = prev_score
-                            curr_dist = prev_dist
+                            if self.rearev_asym_inner_y_ema_enabled and self.rearev_asym_inner_y_ema_alpha > 0.0:
+                                ema_a = float(self.rearev_asym_inner_y_ema_alpha)
+                                y_prev = y_inner_dist
+                                y_inner_dist = ((1.0 - ema_a) * y_inner_dist) + (ema_a * dist_candidate)
+                                y_inner_dist = self._safe_prob_normalize(
+                                    y_inner_dist, fallback=y_prev, eps=1e-6
+                                )
+                                y_inner_score = torch.log(y_inner_dist.clamp(min=1e-8))
+                            score_tp = y_inner_score
+                            curr_dist = y_inner_dist
                         else:
                             score_tp = score_candidate
                             curr_dist = dist_candidate
@@ -845,6 +1417,9 @@ class RecursiveSubgraphReader(nn.Module):
                     break
 
             if self.rearev_asymmetric_yz_enabled:
+                if self.rearev_asym_inner_y_ema_enabled and self.rearev_asym_inner_y_ema_alpha > 0.0:
+                    y_prev_score = y_inner_score
+                    y_prev_dist = y_inner_dist
                 # Outer y-update: after inner z refinement loops, update y exactly once.
                 z_expand = latent_state.unsqueeze(0).expand(h_stage.shape[0], -1)
                 y_prev_col = y_prev_score.unsqueeze(-1)
@@ -943,6 +1518,49 @@ class RecursiveSubgraphReader(nn.Module):
         e: int,
         return_rel_trace: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        if self.gnn_variant == "trm_rel_recursive":
+            return self._inner_recur_trm_rel(
+                h=h,
+                src=src,
+                dst=dst,
+                rel_h=rel_h,
+                rel_h_inv=rel_h_inv,
+                edge_rel_ids=edge_rel_ids,
+                q_inj=q_inj,
+                seed_mask=seed_mask,
+                n=n,
+                e=e,
+                return_rel_trace=return_rel_trace,
+            )
+        if self.gnn_variant == "trm_frontier_recursive":
+            return self._inner_recur_trm_frontier(
+                h=h,
+                src=src,
+                dst=dst,
+                rel_h=rel_h,
+                rel_h_inv=rel_h_inv,
+                edge_rel_ids=edge_rel_ids,
+                q_inj=q_inj,
+                seed_mask=seed_mask,
+                n=n,
+                e=e,
+                return_rel_trace=return_rel_trace,
+            )
+        if self.gnn_variant == "trm_frontier_rearev1":
+            return self._inner_recur_trm_frontier(
+                h=h,
+                src=src,
+                dst=dst,
+                rel_h=rel_h,
+                rel_h_inv=rel_h_inv,
+                edge_rel_ids=edge_rel_ids,
+                q_inj=q_inj,
+                seed_mask=seed_mask,
+                n=n,
+                e=e,
+                return_rel_trace=return_rel_trace,
+                use_rearev1_operator=True,
+            )
         return self._inner_recur_rearev(
             h=h,
             src=src,
@@ -984,11 +1602,20 @@ class RecursiveSubgraphReader(nn.Module):
         trace_step_edge_importance = None
         trace_step_valid_mask = None
         trace_edge_rel_ids = None
+        frontier_step_score_raw = None
+        frontier_step_score_frontier = None
+        frontier_step_y_dist = None
+        frontier_step_y_entropy = None
         aux_steps = int(self.recursion_steps)
+        frontier_like_variant = self.gnn_variant in {"trm_frontier_recursive", "trm_frontier_rearev1"}
+        if frontier_like_variant:
+            aux_steps = int(self.recursion_steps)
         if self.rearev_trm_supervise_all_stages:
             aux_steps = int(max(1, self.rearev_adapt_stages))
             if not self.rearev_asymmetric_yz_enabled:
                 aux_steps = int(self.recursion_steps * max(1, self.rearev_adapt_stages))
+        if frontier_like_variant:
+            aux_steps = int(self.recursion_steps)
         else:
             if self.rearev_asymmetric_yz_enabled:
                 aux_steps = 1
@@ -998,8 +1625,15 @@ class RecursiveSubgraphReader(nn.Module):
             step_valid_mask = torch.zeros(
                 (bsz, aux_steps), dtype=torch.bool, device=node_emb.device
             )
+            if frontier_like_variant:
+                frontier_step_score_raw = node_emb.new_zeros((bsz, aux_steps, max_n))
+                frontier_step_score_frontier = node_emb.new_zeros((bsz, aux_steps, max_n))
+                frontier_step_y_dist = node_emb.new_zeros((bsz, aux_steps, max_n))
+                frontier_step_y_entropy = node_emb.new_zeros((bsz, aux_steps))
         if return_rel_trace:
             trace_steps = int(self.recursion_steps * max(1, self.rearev_adapt_stages))
+            if frontier_like_variant:
+                trace_steps = int(self.recursion_steps)
             max_e = int(edge_mask.shape[1]) if edge_mask.ndim == 2 else 0
             trace_step_logits = node_emb.new_full((bsz, trace_steps, max_n), -1e4)
             trace_step_edge_importance = node_emb.new_zeros((bsz, trace_steps, max_e))
@@ -1085,6 +1719,21 @@ class RecursiveSubgraphReader(nn.Module):
                     step_logits[i, :s, :n] = local_step_logits[:s, :n]
                     step_halt_logits[i, :s] = local_halt[:s]
                     step_valid_mask[i, :s] = local_valid[:s]
+                    if (
+                        frontier_like_variant
+                        and frontier_step_score_raw is not None
+                        and "frontier_step_score_raw" in trm_aux
+                    ):
+                        local_raw = trm_aux["frontier_step_score_raw"]
+                        local_front = trm_aux["frontier_step_score_frontier"]
+                        local_y = trm_aux["frontier_step_y_dist"]
+                        local_ent = trm_aux["frontier_step_y_entropy"]
+                        sf = min(int(s), int(local_raw.shape[0]))
+                        if sf > 0:
+                            frontier_step_score_raw[i, :sf, :n] = local_raw[:sf, :n]
+                            frontier_step_score_frontier[i, :sf, :n] = local_front[:sf, :n]
+                            frontier_step_y_dist[i, :sf, :n] = local_y[:sf, :n]
+                            frontier_step_y_entropy[i, :sf] = local_ent[:sf]
             if return_rel_trace and trm_aux is not None and trace_step_logits is not None:
                 local_trace_logits = trm_aux.get("trace_step_logits", None)
                 local_trace_edges = trm_aux.get("trace_step_edge_importance", None)
@@ -1107,6 +1756,11 @@ class RecursiveSubgraphReader(nn.Module):
                 out["step_logits"] = step_logits
                 out["step_halt_logits"] = step_halt_logits
                 out["step_valid_mask"] = step_valid_mask
+                if frontier_like_variant and frontier_step_score_raw is not None:
+                    out["frontier_step_score_raw"] = frontier_step_score_raw
+                    out["frontier_step_score_frontier"] = frontier_step_score_frontier
+                    out["frontier_step_y_dist"] = frontier_step_y_dist
+                    out["frontier_step_y_entropy"] = frontier_step_y_entropy
             if return_rel_trace:
                 out["trace_step_logits"] = trace_step_logits
                 out["trace_step_edge_importance"] = trace_step_edge_importance
@@ -1791,6 +2445,413 @@ def debug_relation_topk_trace(
         if dump_f is not None:
             dump_f.close()
 
+@torch.no_grad()
+def debug_supervision_step_trace(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    is_main: bool,
+    examples: int = 5,
+    dump_jsonl: str = "",
+    plot_png: str = "",
+    log_prefix: str = "[Trace-Supervision]",
+):
+    if (not is_main) or int(examples) <= 0:
+        return []
+
+    model.eval()
+    max_examples = max(1, int(examples))
+    records: List[dict] = []
+
+    for batch in loader:
+        batch_dev = _move_batch_to_device(batch, device)
+        out = model(
+            node_emb=batch_dev["node_emb"],
+            node_mask=batch_dev["node_mask"],
+            seed_mask=batch_dev.get("seed_mask", None),
+            edge_src=batch_dev["edge_src"],
+            edge_dst=batch_dev["edge_dst"],
+            edge_rel_emb=batch_dev["edge_rel_emb"],
+            edge_rel_ids=batch_dev.get("edge_rel_ids", None),
+            edge_dir=batch_dev.get("edge_dir", None),
+            edge_mask=batch_dev["edge_mask"],
+            q_emb=batch_dev["q_emb"],
+            return_aux=True,
+        )
+        step_logits = out.get("step_logits", None)
+        step_valid_mask = out.get("step_valid_mask", None)
+        final_logits = out.get("logits", None)
+        frontier_step_score_raw = out.get("frontier_step_score_raw", None)
+        frontier_step_score_frontier = out.get("frontier_step_score_frontier", None)
+        frontier_step_y_dist = out.get("frontier_step_y_dist", None)
+        frontier_step_y_entropy = out.get("frontier_step_y_entropy", None)
+        has_frontier_diag = (
+            frontier_step_score_raw is not None
+            and frontier_step_score_frontier is not None
+            and frontier_step_y_dist is not None
+            and frontier_step_y_entropy is not None
+        )
+        if step_logits is None or step_valid_mask is None or final_logits is None:
+            print(f"{log_prefix} step outputs unavailable.")
+            return records
+
+        bsz = int(final_logits.shape[0])
+        for i in range(bsz):
+            if len(records) >= max_examples:
+                break
+            n = int(batch_dev["node_mask"][i].sum().item())
+            if n <= 0:
+                continue
+            valid_nodes = batch_dev["node_mask"][i, :n].to(torch.bool)
+            tgt = (batch_dev["node_labels"][i, :n].to(torch.float32) * valid_nodes.to(torch.float32))
+            tgt_sum = float(tgt.sum().item())
+            has_pos = tgt_sum > 0.0
+            if not has_pos:
+                # Supervision comparison is only meaningful when at least one GT node exists in subgraph.
+                continue
+            tgt_dist = tgt / max(tgt_sum, 1.0)
+            pos_mask = (tgt > 0.0)
+            dist_to_pos: Optional[torch.Tensor] = None
+            if has_frontier_diag:
+                dist_cpu = [n + 1] * n
+                pos_locs = torch.nonzero(pos_mask, as_tuple=False).squeeze(-1).tolist()
+                if pos_locs:
+                    for p in pos_locs:
+                        dist_cpu[int(p)] = 0
+                    adj: List[List[int]] = [[] for _ in range(n)]
+                    e_i = int(batch_dev["edge_mask"][i].sum().item())
+                    if e_i > 0:
+                        src_row = batch_dev["edge_src"][i, :e_i]
+                        dst_row = batch_dev["edge_dst"][i, :e_i]
+                        for s_raw, d_raw in zip(src_row.tolist(), dst_row.tolist()):
+                            s = int(s_raw)
+                            d = int(d_raw)
+                            if 0 <= s < n and 0 <= d < n:
+                                # Undirected local distance for frontier-vs-gold proximity diagnostics.
+                                adj[s].append(d)
+                                adj[d].append(s)
+                    q = deque(int(p) for p in pos_locs)
+                    while q:
+                        u = q.popleft()
+                        nd = int(dist_cpu[u]) + 1
+                        for v in adj[u]:
+                            if nd < int(dist_cpu[v]):
+                                dist_cpu[v] = nd
+                                q.append(v)
+                    dist_to_pos = torch.tensor(dist_cpu, dtype=torch.long, device=final_logits.device)
+
+            orig_id = ""
+            try:
+                orig_id = str(batch.get("orig_ids", [""])[i])
+            except Exception:
+                orig_id = ""
+            step_ids = torch.nonzero(step_valid_mask[i], as_tuple=False).squeeze(-1)
+            rec = {
+                "example_index": int(len(records)),
+                "orig_id": str(orig_id),
+                "has_positive": bool(has_pos),
+                "supervision_steps": [],
+            }
+            for s_idx, t in enumerate(step_ids.tolist(), start=1):
+                row_logits = step_logits[i, t, :n]
+                masked = row_logits.masked_fill(~valid_nodes, -1e9)
+                log_pred = F.log_softmax(masked, dim=0)
+                prob = torch.softmax(masked, dim=0)
+                kl_val = float(F.kl_div(log_pred, tgt_dist, reduction="sum").item())
+                gt_mass = float(prob[pos_mask].sum().item())
+                hit1, f1, precision, recall = _sample_metrics_from_logits(
+                    logits_row=row_logits,
+                    mask_row=batch_dev["node_mask"][i],
+                    node_cids_row=batch_dev["node_cids"][i],
+                    gold_answers=batch["gold_answers"][i],
+                    pred_topk=1,
+                    threshold=0.5,
+                )
+                rec["supervision_steps"].append(
+                    {
+                        "sup_step": int(s_idx),
+                        "model_step_index": int(t) + 1,
+                        "kl": float(kl_val),
+                        "gt_mass": float(gt_mass),
+                        "hit1": float(0.0 if hit1 is None else hit1),
+                        "f1": float(0.0 if f1 is None else f1),
+                        "precision": float(0.0 if precision is None else precision),
+                        "recall": float(0.0 if recall is None else recall),
+                    }
+                )
+                if has_frontier_diag:
+                    raw_row = frontier_step_score_raw[i, t, :n]
+                    front_row = frontier_step_score_frontier[i, t, :n]
+                    y_row = frontier_step_y_dist[i, t, :n].clamp(min=0.0)
+                    y_row = y_row / y_row.sum().clamp(min=1e-12)
+                    raw_masked = raw_row.masked_fill(~valid_nodes, -1e9)
+                    raw_prob = torch.softmax(raw_masked, dim=0)
+                    raw_gt_mass = float(raw_prob[pos_mask].sum().item())
+                    y_gt_mass = float(y_row[pos_mask].sum().item())
+                    y_ent = float(frontier_step_y_entropy[i, t].item())
+                    raw_abs = float(raw_row[valid_nodes].abs().mean().item())
+                    front_abs = float(front_row[valid_nodes].abs().mean().item())
+
+                    total_top_local = int(torch.argmax(prob).item())
+                    raw_top_local = int(torch.argmax(raw_prob).item())
+                    y_top_local = int(torch.argmax(y_row).item())
+                    node_cids_row = batch_dev["node_cids"][i]
+                    topk = min(5, n)
+                    total_topk_local = torch.topk(prob, k=topk, dim=0).indices.tolist()
+                    raw_topk_local = torch.topk(raw_prob, k=topk, dim=0).indices.tolist()
+                    y_topk_local = torch.topk(y_row, k=topk, dim=0).indices.tolist()
+                    total_top_cid = int(node_cids_row[total_top_local].item())
+                    raw_top_cid = int(node_cids_row[raw_top_local].item())
+                    y_top_cid = int(node_cids_row[y_top_local].item())
+                    total_topk_cids = [int(node_cids_row[idx].item()) for idx in total_topk_local]
+                    raw_topk_cids = [int(node_cids_row[idx].item()) for idx in raw_topk_local]
+                    y_topk_cids = [int(node_cids_row[idx].item()) for idx in y_topk_local]
+                    y_mass_d0 = y_mass_d1 = y_mass_d2 = y_mass_d3p = 0.0
+                    if dist_to_pos is not None:
+                        m0 = (dist_to_pos == 0)
+                        m1 = (dist_to_pos == 1)
+                        m2 = (dist_to_pos == 2)
+                        m3p = (dist_to_pos >= 3)
+                        if bool(m0.any()):
+                            y_mass_d0 = float(y_row[m0].sum().item())
+                        if bool(m1.any()):
+                            y_mass_d1 = float(y_row[m1].sum().item())
+                        if bool(m2.any()):
+                            y_mass_d2 = float(y_row[m2].sum().item())
+                        if bool(m3p.any()):
+                            y_mass_d3p = float(y_row[m3p].sum().item())
+
+                    rec["supervision_steps"][-1]["frontier_diag"] = {
+                        "y_entropy": float(y_ent),
+                        "y_gt_mass": float(y_gt_mass),
+                        "raw_gt_mass": float(raw_gt_mass),
+                        "raw_abs_mean": float(raw_abs),
+                        "frontier_abs_mean": float(front_abs),
+                        "y_mass_dist0": float(y_mass_d0),
+                        "y_mass_dist1": float(y_mass_d1),
+                        "y_mass_dist2": float(y_mass_d2),
+                        "y_mass_dist3plus": float(y_mass_d3p),
+                        "top1_cid_raw": int(raw_top_cid),
+                        "top1_cid_total": int(total_top_cid),
+                        "top1_cid_y": int(y_top_cid),
+                        "top5_cids_raw": raw_topk_cids,
+                        "top5_cids_total": total_topk_cids,
+                        "top5_cids_y": y_topk_cids,
+                    }
+
+            f_hit1, f_f1, f_precision, f_recall = _sample_metrics_from_logits(
+                logits_row=final_logits[i, :n],
+                mask_row=batch_dev["node_mask"][i],
+                node_cids_row=batch_dev["node_cids"][i],
+                gold_answers=batch["gold_answers"][i],
+                pred_topk=1,
+                threshold=0.5,
+            )
+            rec["final"] = {
+                "hit1": float(0.0 if f_hit1 is None else f_hit1),
+                "f1": float(0.0 if f_f1 is None else f_f1),
+                "precision": float(0.0 if f_precision is None else f_precision),
+                "recall": float(0.0 if f_recall is None else f_recall),
+            }
+            records.append(rec)
+            step_summaries: List[str] = []
+            for st in rec["supervision_steps"]:
+                frontier_diag = st.get("frontier_diag", None)
+                if isinstance(frontier_diag, dict):
+                    step_summaries.append(
+                        "s{step}:KL={kl:.3f},GT={gt:.4f},H1={h1:.2f},F1={f1:.2f},"
+                        "yH={yh:.3f},yGT={ygt:.4f},rawGT={rgt:.4f},|raw|={ra:.3f},|fr|={fa:.3f},"
+                        "m(d0/d1/d2/d3+)={d0:.3f}/{d1:.3f}/{d2:.3f}/{d3p:.3f},"
+                        "top1(r/t/y)={tr}/{tt}/{ty}".format(
+                            step=int(st.get("sup_step", 0)),
+                            kl=float(st.get("kl", 0.0)),
+                            gt=float(st.get("gt_mass", 0.0)),
+                            h1=float(st.get("hit1", 0.0)),
+                            f1=float(st.get("f1", 0.0)),
+                            yh=float(frontier_diag.get("y_entropy", 0.0)),
+                            ygt=float(frontier_diag.get("y_gt_mass", 0.0)),
+                            rgt=float(frontier_diag.get("raw_gt_mass", 0.0)),
+                            ra=float(frontier_diag.get("raw_abs_mean", 0.0)),
+                            fa=float(frontier_diag.get("frontier_abs_mean", 0.0)),
+                            d0=float(frontier_diag.get("y_mass_dist0", 0.0)),
+                            d1=float(frontier_diag.get("y_mass_dist1", 0.0)),
+                            d2=float(frontier_diag.get("y_mass_dist2", 0.0)),
+                            d3p=float(frontier_diag.get("y_mass_dist3plus", 0.0)),
+                            tr=int(frontier_diag.get("top1_cid_raw", -1)),
+                            tt=int(frontier_diag.get("top1_cid_total", -1)),
+                            ty=int(frontier_diag.get("top1_cid_y", -1)),
+                        )
+                    )
+                else:
+                    step_summaries.append(
+                        "s{step}:KL={kl:.3f},GT={gt:.4f},H1={h1:.2f},F1={f1:.2f}".format(
+                            step=int(st.get("sup_step", 0)),
+                            kl=float(st.get("kl", 0.0)),
+                            gt=float(st.get("gt_mass", 0.0)),
+                            h1=float(st.get("hit1", 0.0)),
+                            f1=float(st.get("f1", 0.0)),
+                        )
+                    )
+            print(
+                f"{log_prefix} ex={rec['example_index']} orig_id={rec['orig_id']} "
+                f"steps={len(rec['supervision_steps'])} final_hit1={rec['final']['hit1']:.4f} "
+                f"final_f1={rec['final']['f1']:.4f}"
+            )
+            if step_summaries:
+                print(f"{log_prefix}   " + " | ".join(step_summaries))
+        if len(records) >= max_examples:
+            break
+
+    if not records:
+        print(f"{log_prefix} no records collected.")
+        return records
+
+    max_steps = max(len(r.get("supervision_steps", [])) for r in records)
+    if max_steps > 0:
+        for sup_step in range(1, max_steps + 1):
+            vals_kl: List[float] = []
+            vals_gt: List[float] = []
+            vals_h1: List[float] = []
+            vals_f1: List[float] = []
+            vals_yh: List[float] = []
+            vals_ygt: List[float] = []
+            vals_rgt: List[float] = []
+            vals_ra: List[float] = []
+            vals_fa: List[float] = []
+            vals_md0: List[float] = []
+            vals_md1: List[float] = []
+            vals_md2: List[float] = []
+            vals_md3p: List[float] = []
+            for rec in records:
+                for st in rec.get("supervision_steps", []):
+                    if int(st.get("sup_step", 0)) == sup_step:
+                        vals_kl.append(float(st.get("kl", 0.0)))
+                        vals_gt.append(float(st.get("gt_mass", 0.0)))
+                        vals_h1.append(float(st.get("hit1", 0.0)))
+                        vals_f1.append(float(st.get("f1", 0.0)))
+                        frontier_diag = st.get("frontier_diag", None)
+                        if isinstance(frontier_diag, dict):
+                            vals_yh.append(float(frontier_diag.get("y_entropy", 0.0)))
+                            vals_ygt.append(float(frontier_diag.get("y_gt_mass", 0.0)))
+                            vals_rgt.append(float(frontier_diag.get("raw_gt_mass", 0.0)))
+                            vals_ra.append(float(frontier_diag.get("raw_abs_mean", 0.0)))
+                            vals_fa.append(float(frontier_diag.get("frontier_abs_mean", 0.0)))
+                            vals_md0.append(float(frontier_diag.get("y_mass_dist0", 0.0)))
+                            vals_md1.append(float(frontier_diag.get("y_mass_dist1", 0.0)))
+                            vals_md2.append(float(frontier_diag.get("y_mass_dist2", 0.0)))
+                            vals_md3p.append(float(frontier_diag.get("y_mass_dist3plus", 0.0)))
+                        break
+            if vals_kl:
+                msg = (
+                    f"{log_prefix} mean_s{sup_step}: "
+                    f"KL={float(np.mean(vals_kl)):.4f} "
+                    f"GT={float(np.mean(vals_gt)):.6f} "
+                    f"H1={float(np.mean(vals_h1)):.4f} "
+                    f"F1={float(np.mean(vals_f1)):.4f}"
+                )
+                if vals_yh:
+                    msg += (
+                        f" yH={float(np.mean(vals_yh)):.4f}"
+                        f" yGT={float(np.mean(vals_ygt)):.6f}"
+                        f" rawGT={float(np.mean(vals_rgt)):.6f}"
+                        f" |raw|={float(np.mean(vals_ra)):.4f}"
+                        f" |fr|={float(np.mean(vals_fa)):.4f}"
+                        f" m(d0/d1/d2/d3+)={float(np.mean(vals_md0)):.4f}/"
+                        f"{float(np.mean(vals_md1)):.4f}/"
+                        f"{float(np.mean(vals_md2)):.4f}/"
+                        f"{float(np.mean(vals_md3p)):.4f}"
+                    )
+                print(msg)
+
+    dump_path = str(dump_jsonl or "").strip()
+    if dump_path:
+        dump_dir = os.path.dirname(dump_path)
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        with open(dump_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"{log_prefix} dumped {len(records)} examples to {dump_path}")
+
+    plot_path = str(plot_png or "").strip()
+    if not plot_path and dump_path:
+        plot_path = os.path.splitext(dump_path)[0] + ".png"
+    if not plot_path:
+        return records
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"{log_prefix} matplotlib unavailable, skip plot: {e}")
+        return records
+
+    max_steps = max(len(r.get("supervision_steps", [])) for r in records)
+    if max_steps <= 0:
+        print(f"{log_prefix} no supervision steps to plot.")
+        return records
+
+    xs = list(range(1, max_steps + 1))
+    kl_rows: List[List[float]] = []
+    gt_rows: List[List[float]] = []
+    hit_rows: List[List[float]] = []
+    for rec in records:
+        steps = rec.get("supervision_steps", [])
+        kl_row = [float("nan")] * max_steps
+        gt_row = [float("nan")] * max_steps
+        hit_row = [float("nan")] * max_steps
+        for i, st in enumerate(steps):
+            if i >= max_steps:
+                break
+            kl_row[i] = float(st.get("kl", 0.0))
+            gt_row[i] = float(st.get("gt_mass", 0.0))
+            hit_row[i] = float(st.get("hit1", 0.0))
+        kl_rows.append(kl_row)
+        gt_rows.append(gt_row)
+        hit_rows.append(hit_row)
+
+    arr_kl = np.array(kl_rows, dtype=np.float64)
+    arr_gt = np.array(gt_rows, dtype=np.float64)
+    arr_hit = np.array(hit_rows, dtype=np.float64)
+    mean_kl = np.nanmean(arr_kl, axis=0)
+    mean_gt = np.nanmean(arr_gt, axis=0)
+    mean_hit = np.nanmean(arr_hit, axis=0)
+
+    plot_dir = os.path.dirname(plot_path)
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    titles = ["KL(target||y_t)", "GT probability mass", "Top1 Hit@1"]
+    ysets = [arr_kl, arr_gt, arr_hit]
+    means = [mean_kl, mean_gt, mean_hit]
+    for ax, title, ys, ymean in zip(axes, titles, ysets, means):
+        for row in ys:
+            ax.plot(xs, row, alpha=0.30, linewidth=1.0)
+        ax.plot(xs, ymean, linewidth=2.2)
+        ax.set_title(title)
+        ax.set_xlabel("Supervision step")
+        ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"{log_prefix} plot saved to {plot_path}")
+    return records
+
+
+def _format_trace_output_path(path: str, ep: int) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    if "{ep}" in p:
+        try:
+            return p.format(ep=int(ep))
+        except Exception:
+            return p.replace("{ep}", str(int(ep)))
+    root, ext = os.path.splitext(p)
+    if ext:
+        return f"{root}_ep{int(ep)}{ext}"
+    return f"{p}_ep{int(ep)}"
+
 
 def _safe_load_state_dict(model: nn.Module, sd: dict) -> Tuple[int, int]:
     if not isinstance(sd, dict):
@@ -1844,6 +2905,7 @@ def _load_model_from_ckpt_or_init(
     rearev_normalized_gnn: bool = False,
     rearev_latent_reasoning_enabled: bool = False,
     rearev_latent_residual_alpha: float = 0.25,
+    rearev_latent_update_mode: str = "gru",
     rearev_global_gate_enabled: bool = False,
     rearev_logit_global_fusion_enabled: bool = False,
     rearev_dynamic_halting_enabled: bool = False,
@@ -1855,6 +2917,11 @@ def _load_model_from_ckpt_or_init(
     rearev_trm_supervise_all_stages: bool = False,
     rearev_act_stop_in_train: bool = False,
     rearev_asymmetric_yz_enabled: bool = False,
+    rearev_asym_inner_y_ema_enabled: bool = False,
+    rearev_asym_inner_y_ema_alpha: float = 0.0,
+    trm_rel_topk_relations: int = 0,
+    trm_rel_score_alpha: float = 1.0,
+    trm_rel_use_relid_policy: bool = True,
 ) -> Tuple[RecursiveSubgraphReader, Optional[dict]]:
     meta = None
     if ckpt_path and os.path.exists(ckpt_path):
@@ -1884,6 +2951,8 @@ def _load_model_from_ckpt_or_init(
                 )
             if isinstance(model_cfg, dict) and "rearev_latent_residual_alpha" in model_cfg:
                 rearev_latent_residual_alpha = float(model_cfg.get("rearev_latent_residual_alpha", 0.25))
+            if isinstance(model_cfg, dict) and "rearev_latent_update_mode" in model_cfg:
+                rearev_latent_update_mode = str(model_cfg.get("rearev_latent_update_mode", "gru"))
             if isinstance(model_cfg, dict) and "rearev_global_gate_enabled" in model_cfg:
                 rearev_global_gate_enabled = _as_bool(model_cfg.get("rearev_global_gate_enabled", False))
             if isinstance(model_cfg, dict) and "rearev_logit_global_fusion_enabled" in model_cfg:
@@ -1918,6 +2987,22 @@ def _load_model_from_ckpt_or_init(
                 rearev_asymmetric_yz_enabled = _as_bool(
                     model_cfg.get("rearev_asymmetric_yz_enabled", False)
                 )
+            if isinstance(model_cfg, dict) and "rearev_asym_inner_y_ema_enabled" in model_cfg:
+                rearev_asym_inner_y_ema_enabled = _as_bool(
+                    model_cfg.get("rearev_asym_inner_y_ema_enabled", False)
+                )
+            if isinstance(model_cfg, dict) and "rearev_asym_inner_y_ema_alpha" in model_cfg:
+                rearev_asym_inner_y_ema_alpha = float(
+                    model_cfg.get("rearev_asym_inner_y_ema_alpha", 0.0)
+                )
+            if isinstance(model_cfg, dict) and "trm_rel_topk_relations" in model_cfg:
+                trm_rel_topk_relations = int(model_cfg.get("trm_rel_topk_relations", 0))
+            if isinstance(model_cfg, dict) and "trm_rel_score_alpha" in model_cfg:
+                trm_rel_score_alpha = float(model_cfg.get("trm_rel_score_alpha", 1.0))
+            if isinstance(model_cfg, dict) and "trm_rel_use_relid_policy" in model_cfg:
+                trm_rel_use_relid_policy = _as_bool(
+                    model_cfg.get("trm_rel_use_relid_policy", True), default=True
+                )
 
     model = RecursiveSubgraphReader(
         entity_dim=entity_dim,
@@ -1935,6 +3020,7 @@ def _load_model_from_ckpt_or_init(
         rearev_normalized_gnn=bool(rearev_normalized_gnn),
         rearev_latent_reasoning_enabled=bool(rearev_latent_reasoning_enabled),
         rearev_latent_residual_alpha=float(max(0.0, rearev_latent_residual_alpha)),
+        rearev_latent_update_mode=str(rearev_latent_update_mode),
         rearev_global_gate_enabled=bool(rearev_global_gate_enabled),
         rearev_logit_global_fusion_enabled=bool(rearev_logit_global_fusion_enabled),
         rearev_dynamic_halting_enabled=bool(rearev_dynamic_halting_enabled),
@@ -1946,6 +3032,11 @@ def _load_model_from_ckpt_or_init(
         rearev_trm_supervise_all_stages=bool(rearev_trm_supervise_all_stages),
         rearev_act_stop_in_train=bool(rearev_act_stop_in_train),
         rearev_asymmetric_yz_enabled=bool(rearev_asymmetric_yz_enabled),
+        rearev_asym_inner_y_ema_enabled=bool(rearev_asym_inner_y_ema_enabled),
+        rearev_asym_inner_y_ema_alpha=float(rearev_asym_inner_y_ema_alpha),
+        trm_rel_topk_relations=max(0, int(trm_rel_topk_relations)),
+        trm_rel_score_alpha=float(max(0.0, trm_rel_score_alpha)),
+        trm_rel_use_relid_policy=bool(trm_rel_use_relid_policy),
     )
     if ckpt_path and os.path.exists(ckpt_path):
         obj = meta if meta is not None else torch.load(ckpt_path, map_location="cpu")
@@ -2002,7 +3093,7 @@ def train_subgraph_reader(
     )
     outer_reasoning_enabled = _as_bool(getattr(args, "subgraph_outer_reasoning_enabled", False))
     outer_reasoning_steps = max(1, int(getattr(args, "subgraph_outer_reasoning_steps", 3)))
-    gnn_variant = "rearev_bfs"
+    gnn_variant = str(getattr(args, "subgraph_gnn_variant", "rearev_bfs")).strip().lower()
     rearev_num_instructions = max(1, int(getattr(args, "subgraph_rearev_num_ins", 3)))
     rearev_adapt_stages = max(1, int(getattr(args, "subgraph_rearev_adapt_stages", 1)))
     rearev_normalized_gnn = _as_bool(getattr(args, "subgraph_rearev_normalized_gnn", False))
@@ -2012,6 +3103,9 @@ def train_subgraph_reader(
     rearev_latent_residual_alpha = max(
         0.0, float(getattr(args, "subgraph_rearev_latent_residual_alpha", 0.25))
     )
+    rearev_latent_update_mode = str(
+        getattr(args, "subgraph_rearev_latent_update_mode", "gru")
+    ).strip().lower()
     rearev_global_gate_enabled = _as_bool(
         getattr(args, "subgraph_rearev_global_gate_enabled", False)
     )
@@ -2044,6 +3138,21 @@ def train_subgraph_reader(
     )
     rearev_asymmetric_yz_enabled = _as_bool(
         getattr(args, "subgraph_rearev_asymmetric_yz_enabled", False)
+    )
+    rearev_asym_inner_y_ema_enabled = _as_bool(
+        getattr(args, "subgraph_rearev_asym_inner_y_ema_enabled", False)
+    )
+    rearev_asym_inner_y_ema_alpha = float(
+        min(1.0, max(0.0, float(getattr(args, "subgraph_rearev_asym_inner_y_ema_alpha", 0.0))))
+    )
+    trm_rel_topk_relations = max(
+        0, int(getattr(args, "subgraph_trm_rel_topk_relations", 0))
+    )
+    trm_rel_score_alpha = float(
+        max(0.0, float(getattr(args, "subgraph_trm_rel_score_alpha", 1.0)))
+    )
+    trm_rel_use_relid_policy = _as_bool(
+        getattr(args, "subgraph_trm_rel_use_relid_policy", True), default=True
     )
     rearev_trm_halt_bce_weight = max(
         0.0, float(getattr(args, "subgraph_rearev_trm_halt_bce_weight", 1.0))
@@ -2148,6 +3257,18 @@ def train_subgraph_reader(
     early_stop_patience = max(0, int(getattr(args, "subgraph_early_stop_patience", 0)))
     early_stop_min_delta = float(getattr(args, "subgraph_early_stop_min_delta", 1e-4))
     early_stop_min_epochs = max(1, int(getattr(args, "subgraph_early_stop_min_epochs", 1)))
+    trace_supervision_enabled = _as_bool(
+        getattr(args, "subgraph_trace_supervision_enabled", False)
+    )
+    trace_supervision_examples = max(
+        1, int(getattr(args, "subgraph_trace_supervision_examples", 5))
+    )
+    trace_supervision_dump_jsonl = str(
+        getattr(args, "subgraph_trace_supervision_dump_jsonl", "")
+    )
+    trace_supervision_plot_png = str(
+        getattr(args, "subgraph_trace_supervision_plot_png", "")
+    )
     grad_accum_steps = max(1, int(getattr(args, "subgraph_grad_accum_steps", 1)))
     resume_epoch_cfg = int(getattr(args, "subgraph_resume_epoch", -1))
     if resume_epoch_cfg >= 0:
@@ -2203,6 +3324,7 @@ def train_subgraph_reader(
         rearev_normalized_gnn=rearev_normalized_gnn,
         rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
         rearev_latent_residual_alpha=rearev_latent_residual_alpha,
+        rearev_latent_update_mode=rearev_latent_update_mode,
         rearev_global_gate_enabled=rearev_global_gate_enabled,
         rearev_logit_global_fusion_enabled=rearev_logit_global_fusion_enabled,
         rearev_dynamic_halting_enabled=rearev_dynamic_halting_enabled,
@@ -2214,10 +3336,23 @@ def train_subgraph_reader(
         rearev_trm_supervise_all_stages=rearev_trm_supervise_all_stages,
         rearev_act_stop_in_train=rearev_act_stop_in_train,
         rearev_asymmetric_yz_enabled=rearev_asymmetric_yz_enabled,
+        rearev_asym_inner_y_ema_enabled=rearev_asym_inner_y_ema_enabled,
+        rearev_asym_inner_y_ema_alpha=rearev_asym_inner_y_ema_alpha,
+        trm_rel_topk_relations=trm_rel_topk_relations,
+        trm_rel_score_alpha=trm_rel_score_alpha,
+        trm_rel_use_relid_policy=trm_rel_use_relid_policy,
     )
     model.to(device)
     ddp_find_unused_default = bool(
-        rearev_trm_style_enabled and rearev_trm_tminus1_no_grad and int(recursion_steps) > 1
+        (
+            rearev_trm_style_enabled
+            and rearev_trm_tminus1_no_grad
+            and int(recursion_steps) > 1
+        )
+        # Frontier/TRM-recursive variants keep optional heads that may not
+        # participate in the active loss path (e.g., final-only KL), so DDP
+        # must track unused parameters by default.
+        or gnn_variant in {"trm_frontier_recursive", "trm_frontier_rearev1", "trm_rel_recursive"}
     )
     ddp_find_unused = _as_bool(
         getattr(args, "subgraph_ddp_find_unused_parameters", ddp_find_unused_default),
@@ -2293,12 +3428,16 @@ def train_subgraph_reader(
             f"outer_reasoning={outer_reasoning_enabled} "
             f"outer_steps={outer_reasoning_steps} "
             f"gnn_variant={gnn_variant} "
+            f"trm_rel_topk={trm_rel_topk_relations} "
+            f"trm_rel_alpha={trm_rel_score_alpha:.3f} "
+            f"trm_rel_relid_policy={trm_rel_use_relid_policy} "
             f"loss_mode={loss_mode} "
             f"rearev_num_ins={rearev_num_instructions} "
             f"rearev_adapt_stages={rearev_adapt_stages} "
             f"rearev_normalized_gnn={rearev_normalized_gnn} "
             f"rearev_latent={rearev_latent_reasoning_enabled} "
             f"rearev_latent_alpha={rearev_latent_residual_alpha:.3f} "
+            f"rearev_latent_update={rearev_latent_update_mode} "
             f"rearev_gate={rearev_global_gate_enabled} "
             f"rearev_logit_fusion={rearev_logit_global_fusion_enabled} "
             f"rearev_dyn_halt={rearev_dynamic_halting_enabled} "
@@ -2310,6 +3449,8 @@ def train_subgraph_reader(
             f"rearev_trm_all_stages={rearev_trm_supervise_all_stages} "
             f"rearev_act_stop_train={rearev_act_stop_in_train} "
             f"rearev_asym_yz={rearev_asymmetric_yz_enabled} "
+            f"rearev_asym_y_ema={rearev_asym_inner_y_ema_enabled} "
+            f"rearev_asym_y_ema_alpha={rearev_asym_inner_y_ema_alpha:.3f} "
             f"rearev_trm_halt_w={rearev_trm_halt_bce_weight:.3f} "
             f"rearev_trm_ce_w={rearev_trm_ce_weight:.3f} "
             f"rearev_trm_w={rearev_trm_weight:.3f} "
@@ -2325,6 +3466,8 @@ def train_subgraph_reader(
             f"early_stop_patience={early_stop_patience} "
             f"early_stop_min_delta={early_stop_min_delta:.6g} "
             f"early_stop_min_epochs={early_stop_min_epochs} "
+            f"trace_sup={trace_supervision_enabled} "
+            f"trace_sup_examples={trace_supervision_examples} "
             f"pos_weight_mode={pos_weight_mode} "
             f"ranking_enabled={ranking_enabled} "
             f"bce_hardneg={bce_hard_negative_enabled} "
@@ -2550,6 +3693,14 @@ def train_subgraph_reader(
                 continue
             do_step = (batch_idx % grad_accum_steps == 0) or (batch_idx == num_batches)
             scaled_loss = loss / float(grad_accum_steps)
+            if not bool(scaled_loss.requires_grad):
+                # Can happen with KL no-positive skip mode when a full mini-batch has no positives.
+                if is_main and (batch_idx <= 3 or (batch_idx % 1000 == 0)):
+                    print(
+                        "[warn] skip backward for no-grad loss "
+                        f"(batch_idx={batch_idx}, loss_mode={loss_mode}, kl_no_pos={kl_no_positive_mode})"
+                    )
+                continue
             if is_ddp and (not do_step):
                 with model.no_sync():
                     scaled_loss.backward()
@@ -2718,11 +3869,15 @@ def train_subgraph_reader(
                     "outer_reasoning_enabled": bool(outer_reasoning_enabled),
                     "outer_reasoning_steps": int(outer_reasoning_steps),
                     "gnn_variant": str(gnn_variant),
+                    "trm_rel_topk_relations": int(trm_rel_topk_relations),
+                    "trm_rel_score_alpha": float(trm_rel_score_alpha),
+                    "trm_rel_use_relid_policy": bool(trm_rel_use_relid_policy),
                     "rearev_num_instructions": int(rearev_num_instructions),
                     "rearev_adapt_stages": int(rearev_adapt_stages),
                     "rearev_normalized_gnn": bool(rearev_normalized_gnn),
                     "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
                     "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
+                    "rearev_latent_update_mode": str(rearev_latent_update_mode),
                     "rearev_global_gate_enabled": bool(rearev_global_gate_enabled),
                     "rearev_logit_global_fusion_enabled": bool(rearev_logit_global_fusion_enabled),
                     "rearev_dynamic_halting_enabled": bool(rearev_dynamic_halting_enabled),
@@ -2734,6 +3889,8 @@ def train_subgraph_reader(
                     "rearev_trm_supervise_all_stages": bool(rearev_trm_supervise_all_stages),
                     "rearev_act_stop_in_train": bool(rearev_act_stop_in_train),
                     "rearev_asymmetric_yz_enabled": bool(rearev_asymmetric_yz_enabled),
+                    "rearev_asym_inner_y_ema_enabled": bool(rearev_asym_inner_y_ema_enabled),
+                    "rearev_asym_inner_y_ema_alpha": float(rearev_asym_inner_y_ema_alpha),
                 },
                 "subgraph_cfg": {
                     "hops": int(hops),
@@ -2746,11 +3903,15 @@ def train_subgraph_reader(
                     "outer_reasoning_enabled": bool(outer_reasoning_enabled),
                     "outer_reasoning_steps": int(outer_reasoning_steps),
                     "gnn_variant": str(gnn_variant),
+                    "trm_rel_topk_relations": int(trm_rel_topk_relations),
+                    "trm_rel_score_alpha": float(trm_rel_score_alpha),
+                    "trm_rel_use_relid_policy": bool(trm_rel_use_relid_policy),
                     "rearev_num_instructions": int(rearev_num_instructions),
                     "rearev_adapt_stages": int(rearev_adapt_stages),
                     "rearev_normalized_gnn": bool(rearev_normalized_gnn),
                     "rearev_latent_reasoning_enabled": bool(rearev_latent_reasoning_enabled),
                     "rearev_latent_residual_alpha": float(rearev_latent_residual_alpha),
+                    "rearev_latent_update_mode": str(rearev_latent_update_mode),
                     "rearev_global_gate_enabled": bool(rearev_global_gate_enabled),
                     "rearev_logit_global_fusion_enabled": bool(rearev_logit_global_fusion_enabled),
                     "rearev_dynamic_halting_enabled": bool(rearev_dynamic_halting_enabled),
@@ -2762,6 +3923,8 @@ def train_subgraph_reader(
                     "rearev_trm_supervise_all_stages": bool(rearev_trm_supervise_all_stages),
                     "rearev_act_stop_in_train": bool(rearev_act_stop_in_train),
                     "rearev_asymmetric_yz_enabled": bool(rearev_asymmetric_yz_enabled),
+                    "rearev_asym_inner_y_ema_enabled": bool(rearev_asym_inner_y_ema_enabled),
+                    "rearev_asym_inner_y_ema_alpha": float(rearev_asym_inner_y_ema_alpha),
                     "rearev_trm_halt_bce_weight": float(rearev_trm_halt_bce_weight),
                     "rearev_trm_ce_weight": float(rearev_trm_ce_weight),
                     "rearev_trm_weight": float(rearev_trm_weight),
@@ -2884,6 +4047,17 @@ def train_subgraph_reader(
                         },
                         step=ep * max(1, len(loader)),
                 )
+                if trace_supervision_enabled:
+                    debug_supervision_step_trace(
+                        model=save_obj,
+                        loader=dev_loader,
+                        device=device,
+                        is_main=True,
+                        examples=trace_supervision_examples,
+                        dump_jsonl=_format_trace_output_path(trace_supervision_dump_jsonl, ep),
+                        plot_png=_format_trace_output_path(trace_supervision_plot_png, ep),
+                        log_prefix=f"[Dev-SupTrace][ep{ep}]",
+                    )
             elif bool(getattr(args, "dev_json", "")):
                 print(f"[Dev-Subgraph] skip eval at ep{ep} (start={eval_start}, every={eval_every})")
 
@@ -3029,7 +4203,9 @@ def test_subgraph_reader(args):
     outer_reasoning_steps = max(
         1, int(getattr(args, "subgraph_outer_reasoning_steps", model_cfg.get("outer_reasoning_steps", 3)))
     )
-    gnn_variant = "rearev_bfs"
+    gnn_variant = str(
+        getattr(args, "subgraph_gnn_variant", model_cfg.get("gnn_variant", "rearev_bfs"))
+    ).strip().lower()
     rearev_num_instructions = max(
         1, int(getattr(args, "subgraph_rearev_num_ins", model_cfg.get("rearev_num_instructions", 3)))
     )
@@ -3056,6 +4232,13 @@ def test_subgraph_reader(args):
             )
         ),
     )
+    rearev_latent_update_mode = str(
+        getattr(
+            args,
+            "subgraph_rearev_latent_update_mode",
+            model_cfg.get("rearev_latent_update_mode", "gru"),
+        )
+    ).strip().lower()
     rearev_global_gate_enabled = _as_bool(
         getattr(
             args,
@@ -3138,6 +4321,58 @@ def test_subgraph_reader(args):
             model_cfg.get("rearev_asymmetric_yz_enabled", False),
         )
     )
+    rearev_asym_inner_y_ema_enabled = _as_bool(
+        getattr(
+            args,
+            "subgraph_rearev_asym_inner_y_ema_enabled",
+            model_cfg.get("rearev_asym_inner_y_ema_enabled", False),
+        )
+    )
+    rearev_asym_inner_y_ema_alpha = float(
+        min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        args,
+                        "subgraph_rearev_asym_inner_y_ema_alpha",
+                        model_cfg.get("rearev_asym_inner_y_ema_alpha", 0.0),
+                    )
+                ),
+            ),
+        )
+    )
+    trm_rel_topk_relations = max(
+        0,
+        int(
+            getattr(
+                args,
+                "subgraph_trm_rel_topk_relations",
+                model_cfg.get("trm_rel_topk_relations", 0),
+            )
+        ),
+    )
+    trm_rel_score_alpha = float(
+        max(
+            0.0,
+            float(
+                getattr(
+                    args,
+                    "subgraph_trm_rel_score_alpha",
+                    model_cfg.get("trm_rel_score_alpha", 1.0),
+                )
+            ),
+        )
+    )
+    trm_rel_use_relid_policy = _as_bool(
+        getattr(
+            args,
+            "subgraph_trm_rel_use_relid_policy",
+            model_cfg.get("trm_rel_use_relid_policy", True),
+        ),
+        default=True,
+    )
 
     model = RecursiveSubgraphReader(
         entity_dim=ent_dim,
@@ -3155,6 +4390,7 @@ def test_subgraph_reader(args):
         rearev_normalized_gnn=rearev_normalized_gnn,
         rearev_latent_reasoning_enabled=rearev_latent_reasoning_enabled,
         rearev_latent_residual_alpha=rearev_latent_residual_alpha,
+        rearev_latent_update_mode=rearev_latent_update_mode,
         rearev_global_gate_enabled=rearev_global_gate_enabled,
         rearev_logit_global_fusion_enabled=rearev_logit_global_fusion_enabled,
         rearev_dynamic_halting_enabled=rearev_dynamic_halting_enabled,
@@ -3166,6 +4402,11 @@ def test_subgraph_reader(args):
         rearev_trm_supervise_all_stages=rearev_trm_supervise_all_stages,
         rearev_act_stop_in_train=rearev_act_stop_in_train,
         rearev_asymmetric_yz_enabled=rearev_asymmetric_yz_enabled,
+        rearev_asym_inner_y_ema_enabled=rearev_asym_inner_y_ema_enabled,
+        rearev_asym_inner_y_ema_alpha=rearev_asym_inner_y_ema_alpha,
+        trm_rel_topk_relations=trm_rel_topk_relations,
+        trm_rel_score_alpha=trm_rel_score_alpha,
+        trm_rel_use_relid_policy=trm_rel_use_relid_policy,
     )
     sd = ckpt_obj.get("model_state", ckpt_obj) if isinstance(ckpt_obj, dict) else ckpt_obj
     skipped, missing = _safe_load_state_dict(model, sd)
@@ -3201,6 +4442,18 @@ def test_subgraph_reader(args):
         trace_rel_log_examples = int(legacy_trace_max)
         trace_rel_dump_max_examples = int(legacy_trace_max)
     trace_path_dump_jsonl = str(getattr(args, "subgraph_trace_path_dump_jsonl", "")).strip()
+    trace_supervision_enabled = _as_bool(
+        getattr(args, "subgraph_trace_supervision_enabled", False)
+    )
+    trace_supervision_examples = max(
+        1, int(getattr(args, "subgraph_trace_supervision_examples", 5))
+    )
+    trace_supervision_dump_jsonl = str(
+        getattr(args, "subgraph_trace_supervision_dump_jsonl", "")
+    ).strip()
+    trace_supervision_plot_png = str(
+        getattr(args, "subgraph_trace_supervision_plot_png", "")
+    ).strip()
     relation_ids, relation_labels = _load_relation_text_labels(args.relations_txt)
     entity_labels = _load_entity_text_labels(args.entities_txt)
 
@@ -3297,6 +4550,21 @@ def test_subgraph_reader(args):
                 is_main=is_main,
                 path_dump_jsonl=trace_path_dump_jsonl,
                 dump_max_examples=trace_rel_dump_max_examples,
+            )
+        if trace_supervision_enabled:
+            if is_ddp:
+                print(
+                    "[Trace-Supervision] DDP enabled: rank0 shard only. "
+                    "Run single-process test for full deterministic traces."
+                )
+            debug_supervision_step_trace(
+                model=model,
+                loader=eval_loader,
+                device=device,
+                is_main=is_main,
+                examples=trace_supervision_examples,
+                dump_jsonl=trace_supervision_dump_jsonl,
+                plot_png=trace_supervision_plot_png,
             )
 
     if is_ddp:
