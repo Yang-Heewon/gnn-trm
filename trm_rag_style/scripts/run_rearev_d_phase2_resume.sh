@@ -16,7 +16,12 @@ infer_resume_epoch() {
   fi
 }
 
-TORCHRUN_BIN="${TORCHRUN_BIN:-/data2/workspace/heewon/anaconda3/envs/taiLab/bin/torchrun}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+if ! command -v "$TORCHRUN_BIN" >/dev/null 2>&1; then
+  echo "[err] torchrun not found: $TORCHRUN_BIN"
+  echo "      install torch distributed launcher or set TORCHRUN_BIN explicitly."
+  exit 1
+fi
 DATASET="${DATASET:-cwq}"
 MODEL_IMPL="${MODEL_IMPL:-trm_hier6}"
 EMB_TAG="${EMB_TAG:-e5_w4_g4}"
@@ -87,6 +92,11 @@ SUBGRAPH_LR_PLATEAU_FACTOR="${SUBGRAPH_LR_PLATEAU_FACTOR:-0.7}"
 SUBGRAPH_LR_PLATEAU_PATIENCE="${SUBGRAPH_LR_PLATEAU_PATIENCE:-1}"
 SUBGRAPH_LR_PLATEAU_THRESHOLD="${SUBGRAPH_LR_PLATEAU_THRESHOLD:-1e-4}"
 SUBGRAPH_LR_PLATEAU_METRIC="${SUBGRAPH_LR_PLATEAU_METRIC:-dev_hit1}"
+SUBGRAPH_EARLY_STOP_ENABLED="${SUBGRAPH_EARLY_STOP_ENABLED:-true}"
+SUBGRAPH_EARLY_STOP_METRIC="${SUBGRAPH_EARLY_STOP_METRIC:-dev_hit1}"
+SUBGRAPH_EARLY_STOP_PATIENCE="${SUBGRAPH_EARLY_STOP_PATIENCE:-4}"
+SUBGRAPH_EARLY_STOP_MIN_DELTA="${SUBGRAPH_EARLY_STOP_MIN_DELTA:-1e-3}"
+SUBGRAPH_EARLY_STOP_MIN_EPOCHS="${SUBGRAPH_EARLY_STOP_MIN_EPOCHS:-8}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export WANDB_ANONYMOUS="${WANDB_ANONYMOUS:-allow}"
@@ -141,6 +151,11 @@ export WANDB_ANONYMOUS="${WANDB_ANONYMOUS:-allow}"
     subgraph_lr_plateau_patience="$SUBGRAPH_LR_PLATEAU_PATIENCE" \
     subgraph_lr_plateau_threshold="$SUBGRAPH_LR_PLATEAU_THRESHOLD" \
     subgraph_lr_plateau_metric="$SUBGRAPH_LR_PLATEAU_METRIC" \
+    subgraph_early_stop_enabled="$SUBGRAPH_EARLY_STOP_ENABLED" \
+    subgraph_early_stop_metric="$SUBGRAPH_EARLY_STOP_METRIC" \
+    subgraph_early_stop_patience="$SUBGRAPH_EARLY_STOP_PATIENCE" \
+    subgraph_early_stop_min_delta="$SUBGRAPH_EARLY_STOP_MIN_DELTA" \
+    subgraph_early_stop_min_epochs="$SUBGRAPH_EARLY_STOP_MIN_EPOCHS" \
     subgraph_rearev_latent_reasoning_enabled="$SUBGRAPH_REAREV_LATENT_REASONING_ENABLED" \
     subgraph_rearev_latent_residual_alpha="$SUBGRAPH_REAREV_LATENT_RESIDUAL_ALPHA" \
     subgraph_rearev_latent_update_mode="$SUBGRAPH_REAREV_LATENT_UPDATE_MODE" \

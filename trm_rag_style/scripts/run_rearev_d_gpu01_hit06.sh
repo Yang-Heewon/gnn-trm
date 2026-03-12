@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-TORCHRUN_BIN="${TORCHRUN_BIN:-/data2/workspace/heewon/anaconda3/envs/taiLab/bin/torchrun}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+if ! command -v "$TORCHRUN_BIN" >/dev/null 2>&1; then
+  echo "[err] torchrun not found: $TORCHRUN_BIN"
+  echo "      install torch distributed launcher or set TORCHRUN_BIN explicitly."
+  exit 1
+fi
 DATASET="${DATASET:-cwq}"
 MODEL_IMPL="${MODEL_IMPL:-trm_hier6}"
 EMB_TAG="${EMB_TAG:-e5_w4_g4}"

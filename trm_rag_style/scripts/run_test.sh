@@ -15,8 +15,29 @@ fi
 DATASET=${DATASET:-cwq}
 MODEL_IMPL=${MODEL_IMPL:-trm_hier6}
 EMB_MODEL=${EMB_MODEL:-intfloat/multilingual-e5-large}
-EMB_TAG=${EMB_TAG:-$(echo "$EMB_MODEL" | tr '/:' '__' | tr -cd '[:alnum:]_.-')}
-EMB_DIR=${EMB_DIR:-trm_agent/emb/${DATASET}_${EMB_TAG}}
+DEFAULT_EMB_TAG_FROM_MODEL="$(echo "$EMB_MODEL" | tr '/:' '__' | tr -cd '[:alnum:]_.-')"
+if [ -n "${EMB_DIR:-}" ]; then
+  EMB_DIR="$EMB_DIR"
+  if [ -n "${EMB_TAG:-}" ]; then
+    EMB_TAG="$EMB_TAG"
+  else
+    EMB_TAG="$(basename "$EMB_DIR")"
+    EMB_TAG="${EMB_TAG#${DATASET}_}"
+  fi
+elif [ -n "${EMB_TAG:-}" ]; then
+  EMB_TAG="$EMB_TAG"
+  EMB_DIR="trm_agent/emb/${DATASET}_${EMB_TAG}"
+else
+  EMB_TAG=""
+  for candidate in "e5_w4_g4" "e5" "$DEFAULT_EMB_TAG_FROM_MODEL"; do
+    if [ -d "trm_agent/emb/${DATASET}_${candidate}" ]; then
+      EMB_TAG="$candidate"
+      break
+    fi
+  done
+  EMB_TAG="${EMB_TAG:-$DEFAULT_EMB_TAG_FROM_MODEL}"
+  EMB_DIR="trm_agent/emb/${DATASET}_${EMB_TAG}"
+fi
 CKPT=${CKPT:-}
 EVAL_LIMIT=${EVAL_LIMIT:--1}
 DEBUG_EVAL_N=${DEBUG_EVAL_N:-5}
@@ -63,6 +84,7 @@ if [ -z "$CKPT" ]; then
   echo "Set CKPT=/path/to/model_epX.pt"
   exit 1
 fi
+echo "[info] using embeddings: EMB_TAG=$EMB_TAG EMB_DIR=$EMB_DIR"
 
 _to_bool() {
   case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in

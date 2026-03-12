@@ -47,7 +47,7 @@ export PHASE2_SUBGRAPH_MAX_NODES="${PHASE2_SUBGRAPH_MAX_NODES:-1536}"
 export PHASE2_SUBGRAPH_MAX_EDGES="${PHASE2_SUBGRAPH_MAX_EDGES:-6144}"
 export PHASE2_SUBGRAPH_DDP_FIND_UNUSED_PARAMETERS="${PHASE2_SUBGRAPH_DDP_FIND_UNUSED_PARAMETERS:-false}"
 export PHASE2_BEST_METRIC="${PHASE2_BEST_METRIC:-dev_hit1}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
 
 echo "[run] webqsp two-phase auto: phase1 -> best ckpt -> phase2"
 bash trm_rag_style/scripts/run_rearev_d_two_phase_auto.sh

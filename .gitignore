@@ -17,3 +17,4 @@ wandb/
 data/.downloads/
 data/CWQ/
 data/data/
+logs/

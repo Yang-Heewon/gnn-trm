@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=/dev/null
+source "$REPO_ROOT/scripts/lib/portable_env.sh"
+PYTHON_BIN="$(require_python_bin)"
 cd "$REPO_ROOT"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
@@ -43,8 +46,8 @@ if [[ "$RUN_PHASE1" == "true" ]]; then
   echo "[phase1] start coarse training with fallback"
   PRIMARY_GPUS="${PRIMARY_GPUS:-0,1,2,3}" \
   PRIMARY_NPROC="${PRIMARY_NPROC:-4}" \
-  FALLBACK_GPUS="${FALLBACK_GPUS:-0,1,2,3}" \
-  FALLBACK_NPROC="${FALLBACK_NPROC:-4}" \
+  FALLBACK_GPUS="${FALLBACK_GPUS:-0,1}" \
+  FALLBACK_NPROC="${FALLBACK_NPROC:-2}" \
   LOG_DIR="$PHASE1_LOG_DIR" \
   CKPT_DIR="$PHASE1_CKPT_DIR" \
   WANDB_RUN_NAME="$PHASE1_WANDB_RUN_NAME" \
@@ -54,8 +57,8 @@ if [[ "$RUN_PHASE1" == "true" ]]; then
   EPOCHS="${PHASE1_EPOCHS:-16}" \
   BATCH_SIZE="${BATCH_SIZE:-2}" \
   SUBGRAPH_GRAD_ACCUM_STEPS="${SUBGRAPH_GRAD_ACCUM_STEPS:-8}" \
-  SUBGRAPH_MAX_NODES="${SUBGRAPH_MAX_NODES:-4096}" \
-  SUBGRAPH_MAX_EDGES="${SUBGRAPH_MAX_EDGES:-16384}" \
+  SUBGRAPH_MAX_NODES="${PHASE1_SUBGRAPH_MAX_NODES:-${SUBGRAPH_MAX_NODES:-4096}}" \
+  SUBGRAPH_MAX_EDGES="${PHASE1_SUBGRAPH_MAX_EDGES:-${SUBGRAPH_MAX_EDGES:-16384}}" \
   SUBGRAPH_RECURSION_STEPS="${PHASE1_SUBGRAPH_RECURSION_STEPS:-${SUBGRAPH_RECURSION_STEPS:-4}}" \
   SUBGRAPH_REAREV_NUM_INS="${PHASE1_SUBGRAPH_REAREV_NUM_INS:-${SUBGRAPH_REAREV_NUM_INS:-3}}" \
   SUBGRAPH_LR_SCHEDULER="${PHASE1_SUBGRAPH_LR_SCHEDULER:-${SUBGRAPH_LR_SCHEDULER:-cosine}}" \
@@ -106,7 +109,7 @@ if [[ -z "$PHASE1_BEST_CKPT" ]]; then
   echo "[phase1] select best ckpt from logs by dev Hit@1"
   PHASE1_BEST_CKPT="$(
     PHASE1_CKPT_DIR="$PHASE1_CKPT_DIR" PHASE1_LOG_DIR="$PHASE1_LOG_DIR" \
-    /data2/workspace/heewon/anaconda3/envs/taiLab/bin/python - <<'PY'
+    $PYTHON_BIN - <<'PY'
 import os, re
 from pathlib import Path
 
@@ -178,8 +181,8 @@ EPOCHS="${PHASE2_EPOCHS:-16}" \
 LR="${PHASE2_LR:-5e-5}" \
 BATCH_SIZE="${PHASE2_BATCH_SIZE:-2}" \
 SUBGRAPH_GRAD_ACCUM_STEPS="${PHASE2_SUBGRAPH_GRAD_ACCUM_STEPS:-4}" \
-SUBGRAPH_MAX_NODES="${PHASE2_SUBGRAPH_MAX_NODES:-2048}" \
-SUBGRAPH_MAX_EDGES="${PHASE2_SUBGRAPH_MAX_EDGES:-8192}" \
+SUBGRAPH_MAX_NODES="${PHASE2_SUBGRAPH_MAX_NODES:-${SUBGRAPH_MAX_NODES:-2048}}" \
+SUBGRAPH_MAX_EDGES="${PHASE2_SUBGRAPH_MAX_EDGES:-${SUBGRAPH_MAX_EDGES:-8192}}" \
 SUBGRAPH_REAREV_NUM_INS="${PHASE2_SUBGRAPH_REAREV_NUM_INS:-${SUBGRAPH_REAREV_NUM_INS:-3}}" \
 SUBGRAPH_RANKING_WEIGHT="${PHASE2_SUBGRAPH_RANKING_WEIGHT:-0.15}" \
 SUBGRAPH_RANKING_MARGIN="${PHASE2_SUBGRAPH_RANKING_MARGIN:-0.2}" \
@@ -206,25 +209,27 @@ SUBGRAPH_LR_PLATEAU_FACTOR="${PHASE2_SUBGRAPH_LR_PLATEAU_FACTOR:-${SUBGRAPH_LR_P
 SUBGRAPH_LR_PLATEAU_PATIENCE="${PHASE2_SUBGRAPH_LR_PLATEAU_PATIENCE:-${SUBGRAPH_LR_PLATEAU_PATIENCE:-1}}" \
 SUBGRAPH_LR_PLATEAU_THRESHOLD="${PHASE2_SUBGRAPH_LR_PLATEAU_THRESHOLD:-${SUBGRAPH_LR_PLATEAU_THRESHOLD:-1e-4}}" \
 SUBGRAPH_LR_PLATEAU_METRIC="${PHASE2_SUBGRAPH_LR_PLATEAU_METRIC:-${SUBGRAPH_LR_PLATEAU_METRIC:-dev_hit1}}" \
+SUBGRAPH_EARLY_STOP_ENABLED="${PHASE2_SUBGRAPH_EARLY_STOP_ENABLED:-true}" \
+SUBGRAPH_EARLY_STOP_METRIC="${PHASE2_SUBGRAPH_EARLY_STOP_METRIC:-dev_hit1}" \
+SUBGRAPH_EARLY_STOP_PATIENCE="${PHASE2_SUBGRAPH_EARLY_STOP_PATIENCE:-4}" \
+SUBGRAPH_EARLY_STOP_MIN_DELTA="${PHASE2_SUBGRAPH_EARLY_STOP_MIN_DELTA:-1e-3}" \
+SUBGRAPH_EARLY_STOP_MIN_EPOCHS="${PHASE2_SUBGRAPH_EARLY_STOP_MIN_EPOCHS:-8}" \
 SUBGRAPH_REAREV_TRM_SUPERVISE_ALL_STAGES="${PHASE2_SUBGRAPH_REAREV_TRM_SUPERVISE_ALL_STAGES:-${PHASE1_SUBGRAPH_REAREV_TRM_SUPERVISE_ALL_STAGES:-false}}" \
 SUBGRAPH_REAREV_ACT_STOP_IN_TRAIN="${PHASE2_SUBGRAPH_REAREV_ACT_STOP_IN_TRAIN:-${PHASE1_SUBGRAPH_REAREV_ACT_STOP_IN_TRAIN:-false}}" \
 SUBGRAPH_REAREV_ASYMMETRIC_YZ_ENABLED="${PHASE2_SUBGRAPH_REAREV_ASYMMETRIC_YZ_ENABLED:-${PHASE1_SUBGRAPH_REAREV_ASYMMETRIC_YZ_ENABLED:-false}}" \
 bash trm_rag_style/scripts/run_rearev_d_phase2_resume.sh 2>&1 | tee "$PHASE2_LOG_FILE"
 
 if [[ -z "$PHASE2_BEST_CKPT" ]]; then
-  echo "[phase2] select best ckpt by ${PHASE2_BEST_METRIC}"
-  PHASE2_BEST_CKPT="$(
-    PHASE2_CKPT_DIR="$PHASE2_CKPT_DIR" PHASE2_LOG_FILE="$PHASE2_LOG_FILE" PHASE2_BEST_METRIC="$PHASE2_BEST_METRIC" \
-    /data2/workspace/heewon/anaconda3/envs/taiLab/bin/python - <<'PY'
+  echo "[phase2] select best ckpt by both metrics (dev_hit1, dev_f1)"
+  PHASE2_BEST_MAP="$(
+    PHASE2_CKPT_DIR="$PHASE2_CKPT_DIR" PHASE2_LOG_FILE="$PHASE2_LOG_FILE" \
+    $PYTHON_BIN - <<'PY'
 import os
 import re
 from pathlib import Path
 
 ckpt_dir = Path(os.environ["PHASE2_CKPT_DIR"])
 log_file = Path(os.environ["PHASE2_LOG_FILE"])
-metric_name = str(os.environ.get("PHASE2_BEST_METRIC", "dev_hit1")).strip().lower()
-if metric_name not in {"dev_hit1", "dev_f1"}:
-    metric_name = "dev_hit1"
 
 if not log_file.exists():
     raise SystemExit("")
@@ -233,7 +238,8 @@ dev_ep_pat = re.compile(r"Dev ep(\d+) \[Subgraph\]")
 hit_pat = re.compile(r"Hit@1=([0-9.]+)")
 f1_pat = re.compile(r"F1=([0-9.]+)")
 
-best = None  # (metric, ep, ckpt_path)
+best_hit = None  # (metric, ep, ckpt_path)
+best_f1 = None   # (metric, ep, ckpt_path)
 cur_ep = None
 with log_file.open("r", encoding="utf-8", errors="ignore") as f:
     for line in f:
@@ -249,32 +255,66 @@ with log_file.open("r", encoding="utf-8", errors="ignore") as f:
             continue
         hit = float(m_hit.group(1))
         f1 = float(m_f1.group(1))
-        metric = hit if metric_name == "dev_hit1" else f1
         ckpt = ckpt_dir / f"model_ep{cur_ep}.pt"
         if not ckpt.exists():
             continue
-        cand = (metric, cur_ep, str(ckpt))
-        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
-            best = cand
+        cand_hit = (hit, cur_ep, str(ckpt))
+        cand_f1 = (f1, cur_ep, str(ckpt))
+        if best_hit is None or cand_hit[0] > best_hit[0] or (cand_hit[0] == best_hit[0] and cand_hit[1] > best_hit[1]):
+            best_hit = cand_hit
+        if best_f1 is None or cand_f1[0] > best_f1[0] or (cand_f1[0] == best_f1[0] and cand_f1[1] > best_f1[1]):
+            best_f1 = cand_f1
 
-if best is None:
+if best_hit is None or best_f1 is None:
     cands = sorted(
         ckpt_dir.glob("model_ep*.pt"),
         key=lambda p: int(re.search(r"model_ep(\d+)\.pt$", p.name).group(1))
     )
     if not cands:
         raise SystemExit("")
-    print(str(cands[-1]))
-else:
-    print(best[2])
+    fallback = str(cands[-1])
+    if best_hit is None:
+        best_hit = (float("-inf"), -1, fallback)
+    if best_f1 is None:
+        best_f1 = (float("-inf"), -1, fallback)
+
+print(f"dev_hit1\t{best_hit[2]}")
+print(f"dev_f1\t{best_f1[2]}")
 PY
   )"
+  PHASE2_BEST_CKPT_HIT1=""
+  PHASE2_BEST_CKPT_F1=""
+  while IFS=$'\t' read -r metric ckpt_path; do
+    [[ -z "${metric:-}" || -z "${ckpt_path:-}" ]] && continue
+    case "$metric" in
+      dev_hit1) PHASE2_BEST_CKPT_HIT1="$ckpt_path" ;;
+      dev_f1) PHASE2_BEST_CKPT_F1="$ckpt_path" ;;
+    esac
+    if [[ -f "$ckpt_path" ]]; then
+      printf "%s\n" "$ckpt_path" > "${PHASE2_CKPT_DIR}/best_${metric}.txt"
+    fi
+  done <<< "$PHASE2_BEST_MAP"
+
+  primary_metric="$(echo "$PHASE2_BEST_METRIC" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$primary_metric" != "dev_hit1" && "$primary_metric" != "dev_f1" ]]; then
+    primary_metric="dev_hit1"
+  fi
+  if [[ "$primary_metric" == "dev_f1" ]]; then
+    PHASE2_BEST_CKPT="$PHASE2_BEST_CKPT_F1"
+  else
+    PHASE2_BEST_CKPT="$PHASE2_BEST_CKPT_HIT1"
+  fi
 fi
 
+if [[ -n "${PHASE2_BEST_CKPT_HIT1:-}" && -f "${PHASE2_BEST_CKPT_HIT1:-}" ]]; then
+  echo "[phase2] best ckpt (dev_hit1): $PHASE2_BEST_CKPT_HIT1"
+fi
+if [[ -n "${PHASE2_BEST_CKPT_F1:-}" && -f "${PHASE2_BEST_CKPT_F1:-}" ]]; then
+  echo "[phase2] best ckpt (dev_f1): $PHASE2_BEST_CKPT_F1"
+fi
 if [[ -n "$PHASE2_BEST_CKPT" && -f "$PHASE2_BEST_CKPT" ]]; then
-  echo "[phase2] best ckpt: $PHASE2_BEST_CKPT"
-  printf "%s\n" "$PHASE2_BEST_CKPT" > "${PHASE2_CKPT_DIR}/best_${PHASE2_BEST_METRIC}.txt"
-else
+  echo "[phase2] selected primary (${PHASE2_BEST_METRIC}) ckpt: $PHASE2_BEST_CKPT"
+elif [[ -z "${PHASE2_BEST_CKPT_HIT1:-}" && -z "${PHASE2_BEST_CKPT_F1:-}" ]]; then
   echo "[warn] could not determine phase2 best checkpoint."
 fi
 
@@ -290,4 +330,8 @@ if [[ "$AUTO_RUN_LATENT_ABLATION" == "true" ]]; then
   fi
 fi
 
+if [[ -f "${PHASE2_CKPT_DIR}/best_dev_f1.txt" || -f "${PHASE2_CKPT_DIR}/best_dev_hit1.txt" ]]; then
+  echo "[next] evaluate best checkpoint:"
+  echo "       CKPT_DIR=$PHASE2_CKPT_DIR METRIC=${PHASE2_BEST_METRIC} bash trm_rag_style/scripts/run_test_best_ckpt.sh"
+fi
 echo "[done] two-phase pipeline finished"
