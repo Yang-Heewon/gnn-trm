@@ -63,5 +63,5 @@ def load_tokenizer(name: str):
     try:
         return AutoTokenizer.from_pretrained(name, trust_remote_code=True)
     except Exception:
-        print(f"⚠️ failed to load tokenizer '{name}', falling back to local-hash tokenizer")
+        print(f"[warn] failed to load tokenizer '{name}', falling back to local-hash tokenizer")
         return LocalHashTokenizer()

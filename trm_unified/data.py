@@ -1,6 +1,7 @@
 import json
 import multiprocessing as mp
 import os
+import sys
 from collections import defaultdict, deque
 from typing import Dict, Iterable, List, Tuple
 
@@ -8,6 +9,12 @@ from tqdm import tqdm
 
 
 _PP_CFG = {}
+
+
+def _safe_warn_text(raw) -> str:
+    msg = str(raw)
+    enc = sys.stdout.encoding or "utf-8"
+    return msg.encode(enc, errors="backslashreplace").decode(enc, errors="ignore")
 
 
 def iter_json_records(path: str) -> Iterable[dict]:
@@ -147,7 +154,7 @@ def build_line_offsets(jsonl_path: str, is_main: bool = True) -> List[int]:
             off = f.tell()
             line = f.readline()
     if is_main:
-        print(f"✅ Indexed {len(offsets)} lines from {jsonl_path}")
+        print(f"[ok] Indexed {len(offsets)} lines from {jsonl_path}")
     return offsets
 
 
@@ -322,7 +329,7 @@ def preprocess_split(
                         kept += 1
                         pbar.update(1)
             except (PermissionError, OSError) as e:
-                print(f"[warn] multiprocessing disabled ({e}); fallback to single worker.")
+                print(f"[warn] multiprocessing disabled ({_safe_warn_text(e)}); fallback to single worker.")
                 for ex in iter_json_records(input_path):
                     total += 1
                     obj = _normalize_one(

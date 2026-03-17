@@ -3,6 +3,7 @@ import math
 import os
 import re
 import json
+import sys
 import random
 from datetime import timedelta
 from collections import deque
@@ -82,6 +83,21 @@ def _setup_wandb(args, is_main: bool):
         },
     )
     return run
+
+
+def _progress_write_line(message: str, last_chars: int = 0) -> int:
+    msg = str(message)
+    width = max(int(last_chars), len(msg))
+    sys.stdout.write("\r" + msg.ljust(width))
+    sys.stdout.flush()
+    return width
+
+
+def _progress_finish_line(last_chars: int = 0) -> None:
+    if last_chars > 0:
+        sys.stdout.write("\r" + (" " * int(last_chars)) + "\r")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -1754,7 +1770,17 @@ def train(args):
                 f"train_acc_mode={epoch_acc_mode}"
             )
         last_phase2_state = bool(use_phase2)
-        pbar = tqdm(loader, disable=not is_main, desc=f'Ep {ep}')
+        progress_single_line = _as_bool(getattr(args, 'progress_single_line', False), default=False)
+        progress_log_every = max(1, int(getattr(args, 'progress_log_every', 50)))
+        progress_mininterval = max(0.5, float(getattr(args, 'progress_mininterval', 1.0)))
+        num_batches = len(loader)
+        pbar = loader if progress_single_line else tqdm(
+            loader,
+            disable=not is_main,
+            desc=f'Ep {ep}',
+            dynamic_ncols=True,
+            mininterval=progress_mininterval,
+        )
         sanity_interval_steps = 0
         if train_sanity_eval_every_pct > 0:
             sanity_interval_steps = max(1, int(math.ceil((float(len(loader)) * float(train_sanity_eval_every_pct)) / 100.0)))
@@ -1765,6 +1791,7 @@ def train(args):
         tot_rel_correct = 0
         tot_rel_count = 0
         steps = 0
+        last_progress_chars = 0
         for batch in pbar:
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             attn = batch['attention_mask'].to(device, non_blocking=True)
@@ -1959,6 +1986,11 @@ def train(args):
             opt.step()
             tot_loss += bl.item()
             steps += 1
+            should_update_progress = (
+                steps == 1
+                or steps == num_batches
+                or (progress_log_every > 0 and (steps % progress_log_every) == 0)
+            )
             if is_main:
                 rel_acc = 100.0 * (tot_rel_correct / max(1, tot_rel_count))
                 endpoint_hit1_proxy = 100.0 * (tot_metric_sum / max(1, tot_metric_count))
@@ -1977,16 +2009,33 @@ def train(args):
                     else:
                         acc = rel_acc
                         acc_label = 'rel_acc_fallback'
-                if cur_rl_scst_mode:
-                    pbar.set_postfix_str(
-                        f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
-                        f'reward={avg_reward:.4f} adv={avg_adv:.4f} acc({acc_label})={acc:.2f}% grad={float(grad_norm):.2e}'
-                    )
-                else:
-                    pbar.set_postfix_str(
-                        f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
-                        f'acc({acc_label})={acc:.2f}% rel_acc={rel_acc:.2f}% ep_f1_proxy={endpoint_f1_proxy:.2f}% grad={float(grad_norm):.2e}'
-                    )
+                if should_update_progress and not progress_single_line:
+                    if cur_rl_scst_mode:
+                        pbar.set_postfix_str(
+                            f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
+                            f'reward={avg_reward:.4f} adv={avg_adv:.4f} acc({acc_label})={acc:.2f}% grad={float(grad_norm):.2e}'
+                        )
+                    else:
+                        pbar.set_postfix_str(
+                            f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
+                            f'acc({acc_label})={acc:.2f}% rel_acc={rel_acc:.2f}% ep_f1_proxy={endpoint_f1_proxy:.2f}% grad={float(grad_norm):.2e}'
+                        )
+                if should_update_progress and progress_single_line:
+                    if cur_rl_scst_mode:
+                        msg = (
+                            f"Ep {ep} {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"reward={avg_reward:.4f} adv={avg_adv:.4f} "
+                            f"acc({acc_label})={acc:.2f}% grad={float(grad_norm):.2e}"
+                        )
+                    else:
+                        msg = (
+                            f"Ep {ep} {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"acc({acc_label})={acc:.2f}% rel_acc={rel_acc:.2f}% "
+                            f"ep_f1_proxy={endpoint_f1_proxy:.2f}% grad={float(grad_norm):.2e}"
+                        )
+                    last_progress_chars = _progress_write_line(msg, last_progress_chars)
                 if wb is not None:
                     wb_payload = {
                         "train/step_loss": float(bl.item()),
@@ -2080,6 +2129,8 @@ def train(args):
         epoch_tot_metric_f1_sum = float(tot_metric_f1_sum)
         epoch_tot_rel_correct = int(tot_rel_correct)
         epoch_tot_rel_count = int(tot_rel_count)
+        if is_main and progress_single_line:
+            _progress_finish_line(last_progress_chars)
         if is_ddp:
             # Aggregate epoch metrics across all ranks so train_acc is not rank0-local.
             epoch_reduce = torch.tensor(
@@ -2332,7 +2383,7 @@ def test(args):
         inner = model.inner
         return carry_cls(inner.empty_carry(B), torch.zeros(B, device=device), torch.ones(B, dtype=torch.bool, device=device), {})
 
-    print('✅ checkpoint loaded:', args.ckpt)
+    print("[ok] checkpoint loaded:", args.ckpt)
     if getattr(args, 'eval_json', ''):
         mh, mf, sk = evaluate_relation_beam(
             model=model,

@@ -85,7 +85,7 @@ def run(cfg):
     custom = _custom_link_inputs(cfg)
     if custom is not None:
         out["linked_inputs"] = custom
-        print("✅ preprocess done:", out)
+        print("[ok] preprocess done:", out)
         return out
 
     train_out = os.path.join(cfg['processed_dir'], 'train.jsonl')
@@ -128,7 +128,7 @@ def run(cfg):
     if test_in:
         if not os.path.exists(test_in):
             print(f"[warn] test_in not found: {test_in} (skip test preprocess)")
-            print('✅ preprocess done:', out)
+            print("[ok] preprocess done:", out)
             return out
         test_out = os.path.join(cfg['processed_dir'], 'test.jsonl')
         te = preprocess_split(
@@ -146,5 +146,5 @@ def run(cfg):
         )
         out['test'] = te
 
-    print('✅ preprocess done:', out)
+    print("[ok] preprocess done:", out)
     return out

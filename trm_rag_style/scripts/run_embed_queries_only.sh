@@ -150,7 +150,7 @@ if save_lists:
         save_lines(out_dir / "query_test_ids.txt", q_test_ids)
 
 print(
-    "✅ query-only embed done:",
+    "[ok] query-only embed done:",
     {
         "out_dir": str(out_dir),
         "query_train_shape": list(qtr.shape),

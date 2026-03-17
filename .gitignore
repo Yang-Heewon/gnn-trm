@@ -15,6 +15,12 @@ data/*_split.jsonl
 data/*_entity_text.txt
 wandb/
 data/.downloads/
+data/biohopr/
+data/primekgqa/
+data/medhopqa/
+data/primekgqa_raw/
+data/medhopqa_raw/
 data/CWQ/
 data/data/
 logs/
+tmp_medical_smoke/

@@ -9,6 +9,7 @@ Only D and D+ pipelines are supported.
 
 ## Core Scripts
 
+- `../../scripts/run_rearev_r6i5.py`: Python `r6i5` launcher for `cwq` / `webqsp` (`prepare`, train, `test-best`)
 - `run_download.sh`: dataset download/prepare
 - `run_embed.sh`: embedding build
 - `run_rearev_d_auto_fallback_4to2.sh`: phase1 fallback launcher (4GPU -> 2GPU on OOM)

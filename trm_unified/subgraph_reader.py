@@ -2,6 +2,7 @@ import math
 import os
 import re
 import json
+import sys
 from collections import deque
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -30,6 +31,21 @@ def _as_bool(v, default: bool = False) -> bool:
     if s in {"0", "false", "no", "n", "off"}:
         return False
     return bool(default)
+
+
+def _progress_write_line(message: str, last_chars: int = 0) -> int:
+    msg = str(message)
+    width = max(int(last_chars), len(msg))
+    sys.stdout.write("\r" + msg.ljust(width))
+    sys.stdout.flush()
+    return width
+
+
+def _progress_finish_line(last_chars: int = 0) -> None:
+    if last_chars > 0:
+        sys.stdout.write("\r" + (" " * int(last_chars)) + "\r")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def _coerce_int_list(values) -> List[int]:
@@ -3477,12 +3493,22 @@ def train_subgraph_reader(
     early_best_metric = None
     early_bad_epochs = 0
 
+    progress_single_line = _as_bool(getattr(args, "progress_single_line", False), default=False)
+    progress_log_every = max(1, int(getattr(args, "progress_log_every", 50)))
+    progress_mininterval = max(0.5, float(getattr(args, "progress_mininterval", 1.0)))
+
     for local_ep in range(1, int(args.epochs) + 1):
         ep = int(resume_epoch + local_ep)
         if sampler is not None:
             sampler.set_epoch(ep)
         model.train()
-        pbar = tqdm(loader, disable=not is_main, desc=f"Ep {ep} [Subgraph]")
+        pbar = loader if progress_single_line else tqdm(
+            loader,
+            disable=not is_main,
+            desc=f"Ep {ep} [Subgraph]",
+            dynamic_ncols=True,
+            mininterval=progress_mininterval,
+        )
         tot_loss = 0.0
         tot_obj_loss = 0.0
         tot_halt_loss = 0.0
@@ -3495,6 +3521,7 @@ def train_subgraph_reader(
         opt.zero_grad(set_to_none=True)
         last_grad_norm = 0.0
         num_batches = len(loader)
+        last_progress_chars = 0
 
         for batch_idx, batch in enumerate(pbar, start=1):
             batch_dev = _move_batch_to_device(batch, device)
@@ -3720,42 +3747,97 @@ def train_subgraph_reader(
             obj_aux_sum += int(obj_aux)
             halt_aux_sum += int(halt_aux)
 
+            should_update_progress = (
+                steps == 1
+                or steps == num_batches
+                or (progress_log_every > 0 and (steps % progress_log_every) == 0)
+            )
+
             if is_main:
                 if uses_trm_objective:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} ce+halt={obj_loss.item():.4f} "
-                        f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
-                        f"grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} ce+halt={obj_loss.item():.4f} "
+                            f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
                 elif uses_kl_halt_objective:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
-                        f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
-                        f"grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
                 elif uses_kl_trm_objective:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
-                        f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
-                        f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
+                        )
                 elif uses_kl_objective and uses_kl_deep_supervision:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
-                        f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
-                        f"rank={rank_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
-                        f"grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
+                            f"rank={rank_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
                 elif uses_kl_objective:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} kl={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
-                        f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} kl={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
+                        )
                 else:
-                    pbar.set_postfix_str(
-                        f"loss={loss.item():.4f} bce={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
-                        f"avg={tot_loss/max(1,steps):.4f} pw={step_pos_weight:.2f} grad={grad_norm_val:.2e}"
-                    )
+                    if should_update_progress and not progress_single_line:
+                        pbar.set_postfix_str(
+                            f"loss={loss.item():.4f} bce={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} pw={step_pos_weight:.2f} grad={grad_norm_val:.2e}"
+                        )
+                if should_update_progress and progress_single_line:
+                    if uses_trm_objective:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} ce+halt={obj_loss.item():.4f} "
+                            f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
+                    elif uses_kl_halt_objective:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"halt={halt_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
+                    elif uses_kl_trm_objective:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
+                        )
+                    elif uses_kl_objective and uses_kl_deep_supervision:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} kl={kl_component.item():.4f} "
+                            f"trm_ce={trm_ce_component.item():.4f} halt={halt_loss.item():.4f} "
+                            f"rank={rank_loss.item():.4f} avg={tot_loss/max(1,steps):.4f} "
+                            f"grad={grad_norm_val:.2e}"
+                        )
+                    elif uses_kl_objective:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} kl={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} grad={grad_norm_val:.2e}"
+                        )
+                    else:
+                        msg = (
+                            f"Ep {ep} [Subgraph] {steps}/{num_batches} ({(100.0 * steps) / max(1, num_batches):.1f}%) "
+                            f"loss={loss.item():.4f} bce={obj_loss.item():.4f} rank={rank_loss.item():.4f} "
+                            f"avg={tot_loss/max(1,steps):.4f} pw={step_pos_weight:.2f} grad={grad_norm_val:.2e}"
+                        )
+                    last_progress_chars = _progress_write_line(msg, last_progress_chars)
                 if wb is not None:
                     step_log = {
                         "train/step_loss": float(loss.item()),
@@ -3846,6 +3928,9 @@ def train_subgraph_reader(
         dev_f1 = None
         dev_precision = None
         dev_recall = None
+
+        if is_main and progress_single_line:
+            _progress_finish_line(last_progress_chars)
 
         if is_main:
             os.makedirs(args.out_dir, exist_ok=True)
@@ -4486,7 +4571,7 @@ def test_subgraph_reader(args):
     )
 
     if is_main:
-        print("✅ subgraph-reader checkpoint loaded:", args.ckpt)
+        print("[ok] subgraph-reader checkpoint loaded:", args.ckpt)
     out = evaluate_subgraph_reader(
         model=model,
         loader=eval_loader,

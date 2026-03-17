@@ -20,3 +20,4 @@ echo "  - data/CWQ/entities.txt"
 echo "  - data/CWQ/relations.txt"
 echo "  - data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt"
 echo "  - data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
+

@@ -2,10 +2,86 @@
 import argparse
 import json
 import os
+import re
 import shutil
+from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from tqdm import tqdm
+
+
+def _snake_case_name(raw: str) -> str:
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(raw or ""))
+    return s.replace("__", "_").strip().lower()
+
+
+def _candidate_hf_cache_roots(cache_dir: str = "") -> List[Path]:
+    roots: List[Path] = []
+
+    def _push(path_str: str):
+        if not path_str:
+            return
+        p = Path(os.path.expanduser(os.path.expandvars(path_str))).resolve()
+        if p not in roots:
+            roots.append(p)
+
+    if cache_dir:
+        _push(cache_dir)
+        _push(str(Path(cache_dir) / "datasets"))
+    _push(os.environ.get("HF_DATASETS_CACHE", ""))
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        _push(str(Path(hf_home) / "datasets"))
+    _push(str(Path.home() / ".cache" / "huggingface" / "datasets"))
+    return roots
+
+
+def _find_cached_arrow_dataset_dir(hf_name: str, cache_dir: str = "") -> Path:
+    repo_name = str(hf_name or "").split("/")[-1]
+    snake_repo = _snake_case_name(repo_name)
+    tokens = {repo_name.lower(), snake_repo}
+
+    candidates: List[Tuple[float, Path]] = []
+    for root in _candidate_hf_cache_roots(cache_dir):
+        if not root.exists():
+            continue
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            child_name = child.name.lower()
+            if not any(tok and tok in child_name for tok in tokens):
+                continue
+            for info_path in child.glob("*/*/*/dataset_info.json"):
+                ds_dir = info_path.parent
+                if list(ds_dir.glob("*-train-*.arrow")):
+                    candidates.append((ds_dir.stat().st_mtime, ds_dir))
+
+    if not candidates:
+        raise FileNotFoundError(f"no cached arrow dataset directory found for {hf_name}")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _load_dataset_from_cached_arrow(hf_name: str, cache_dir: str = ""):
+    from datasets import Dataset, DatasetDict, concatenate_datasets
+
+    ds_dir = _find_cached_arrow_dataset_dir(hf_name, cache_dir=cache_dir)
+    split_globs = {
+        "train": "*-train-*.arrow",
+        "validation": "*-validation-*.arrow",
+        "test": "*-test-*.arrow",
+    }
+    out = {}
+    for split_name, pattern in split_globs.items():
+        shard_paths = sorted(ds_dir.glob(pattern))
+        if not shard_paths:
+            continue
+        shards = [Dataset.from_file(str(p)) for p in shard_paths]
+        out[split_name] = concatenate_datasets(shards) if len(shards) > 1 else shards[0]
+    if not out:
+        raise FileNotFoundError(f"cached arrow shards missing under {ds_dir}")
+    print(f"[load] {hf_name} (cached arrow: {ds_dir})")
+    return DatasetDict(out)
 
 
 def _norm_text(x) -> str:
@@ -204,18 +280,30 @@ def _convert_dataset(
             "huggingface datasets package is required. Install with: pip install datasets"
         ) from e
 
-    kwargs = {}
-    if cache_dir:
-        kwargs["cache_dir"] = cache_dir
-    print(f"[load] {hf_name}")
+    ds_dict = None
+    cache_err = None
     try:
-        ds_dict = load_dataset(hf_name, **kwargs)
+        ds_dict = _load_dataset_from_cached_arrow(hf_name, cache_dir=cache_dir)
     except Exception as e:
-        raise RuntimeError(
-            f"failed to load Hugging Face dataset '{hf_name}'. "
-            "Check internet access / HF auth / dataset name, "
-            "or pre-download into local cache and set HF_CACHE_DIR."
-        ) from e
+        cache_err = e
+
+    if ds_dict is None:
+        kwargs = {}
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        print(f"[load] {hf_name}")
+        try:
+            ds_dict = load_dataset(hf_name, **kwargs)
+        except Exception as e:
+            cache_msg = ""
+            if cache_err is not None:
+                cache_msg = f" cached-arrow fallback also failed: {cache_err}."
+            raise RuntimeError(
+                f"failed to load Hugging Face dataset '{hf_name}'."
+                f"{cache_msg} "
+                "Check internet access / HF auth / dataset name, "
+                "or pre-download into local cache and set HF_CACHE_DIR."
+            ) from e
 
     ent_vocab, rel_vocab = _build_vocab(ds_dict)
 

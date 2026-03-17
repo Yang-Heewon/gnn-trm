@@ -20,6 +20,10 @@ def run(cfg):
         query_prefix=str(cfg.get('embed_query_prefix', '')),
         passage_prefix=str(cfg.get('embed_passage_prefix', '')),
         save_lists=bool(cfg.get('embed_save_lists', True)),
+        auto_batch=bool(cfg.get('embed_auto_batch', False)),
+        auto_batch_min=int(cfg.get('embed_auto_batch_min', 4)),
+        auto_batch_max=int(cfg.get('embed_auto_batch_max', 512)),
+        auto_batch_vram_frac=float(cfg.get('embed_auto_batch_vram_frac', 0.85)),
     )
-    print('✅ embed done:', meta)
+    print("[ok] embed done:", meta)
     return meta
