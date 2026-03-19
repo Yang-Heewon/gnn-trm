@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import gc
+import json
 import os
 import re
 import subprocess
@@ -18,6 +19,9 @@ PHASE1_EP_PAT = re.compile(r"Dev ep(\d+) \[Subgraph\]")
 PHASE1_HIT_PAT = re.compile(r"\[Dev-Subgraph\] Hit@1=([0-9.]+)")
 PHASE2_HIT_PAT = re.compile(r"Hit@1=([0-9.]+)")
 PHASE2_F1_PAT = re.compile(r"F1=([0-9.]+)")
+TEST_SUBGRAPH_PAT = re.compile(
+    r"\[Test-Subgraph\]\s+Hit@1=([0-9.]+)\s+F1=([0-9.]+)\s+Precision=([0-9.]+)\s+Recall=([0-9.]+)\s+Skip=(\d+)"
+)
 DEFAULT_WANDB_ENTITY = "heewon6205-chung-ang-university"
 DEFAULT_WANDB_PROJECT = "paper_final"
 BUILTIN_HF_DATASETS = {"cwq", "webqsp"}
@@ -82,6 +86,14 @@ def _default_embed_backend(dataset: str) -> str:
     if dataset in {"primekgqa", "biohopr", "medhopqa"}:
         return "transformers"
     return "sentence_transformers"
+
+
+def _default_entity_names_json(dataset: str) -> str:
+    if dataset == "medhopqa":
+        return "data/medhopqa/entity_names.json"
+    if dataset in {"cwq", "webqsp"}:
+        return "data/data/entities_names.json"
+    return ""
 
 
 def _default_nproc() -> int:
@@ -215,6 +227,10 @@ def _variant_display_name(variant: str) -> str:
     return "D+" if str(variant).strip().lower() == "dplus" else "D"
 
 
+def _variant_path_tag(variant: str) -> str:
+    return "Dplus" if str(variant).strip().lower() == "dplus" else "D"
+
+
 def _recipe_display_name(recursion_steps: int, instructions: int) -> str:
     return f"r{int(recursion_steps)}i{int(instructions)}"
 
@@ -244,6 +260,90 @@ def _looks_like_complete_json_array(path: Path) -> bool:
     except Exception:
         return False
     return False
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _salvage_json_array_to_jsonl(source: Path, target: Path, *, chunk_chars: int = 1 << 20) -> int:
+    if not source.exists():
+        return 0
+    if target.exists() and target.stat().st_mtime >= source.stat().st_mtime and target.stat().st_size > 0:
+        return _count_nonempty_lines(target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    decoder = json.JSONDecoder()
+    record_count = 0
+    buffer = ""
+    started = False
+
+    with source.open("r", encoding="utf-8", errors="ignore") as src, tmp_path.open("w", encoding="utf-8") as out:
+        eof = False
+        while True:
+            chunk = src.read(chunk_chars)
+            if chunk:
+                buffer += chunk
+            else:
+                eof = True
+
+            idx = 0
+            while True:
+                while idx < len(buffer) and buffer[idx].isspace():
+                    idx += 1
+
+                if not started:
+                    if idx >= len(buffer):
+                        break
+                    if buffer[idx] != "[":
+                        raise ValueError(f"{source} is not a JSON array")
+                    started = True
+                    idx += 1
+                    continue
+
+                while idx < len(buffer) and (buffer[idx].isspace() or buffer[idx] == ","):
+                    idx += 1
+                if idx >= len(buffer):
+                    break
+                if buffer[idx] == "]":
+                    idx += 1
+                    buffer = buffer[idx:]
+                    idx = 0
+                    eof = True
+                    break
+
+                try:
+                    obj, end_idx = decoder.raw_decode(buffer, idx)
+                except json.JSONDecodeError:
+                    if eof:
+                        break
+                    break
+
+                out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                record_count += 1
+                idx = end_idx
+
+            buffer = buffer[idx:]
+            if eof:
+                break
+
+    if record_count <= 0:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+
+    tmp_path.replace(target)
+    return record_count
 
 
 def _log_has_oom_signature(log_path: Path) -> bool:
@@ -660,9 +760,9 @@ def _phase2_best_ckpts(ckpt_dir: Path, log_path: Path) -> Dict[str, Path]:
     return result
 
 
-def _latest_phase2_dir(dataset: str) -> Path:
+def _latest_phase2_dir(dataset: str, variant: str) -> Path:
     ckpt_root = REPO_ROOT / "trm_agent" / "ckpt"
-    pattern = f"{dataset}_*_rearev_D_phase2_*"
+    pattern = f"{dataset}_*_rearev_{_variant_path_tag(variant)}_phase2_*"
     candidates = [path for path in ckpt_root.glob(pattern) if path.is_dir()]
     if not candidates:
         raise FileNotFoundError(f"No phase2 checkpoint directory found for dataset={dataset}")
@@ -944,20 +1044,30 @@ def _prepare_common_overrides(args: argparse.Namespace) -> Dict[str, str]:
     return common_prepare
 
 
-def _downloaded_medical_converter_cmd(dataset: str) -> Optional[List[str]]:
+def _downloaded_medical_converter_cmd(args: argparse.Namespace, dataset: str) -> Optional[List[str]]:
     if dataset == "primekgqa":
         raw_root = REPO_ROOT / "data" / "primekgqa_raw"
         train_in = raw_root / "train_v2_call_bioLLM.json"
+        if str(args.primekgqa_train_override).strip():
+            train_in = Path(args.primekgqa_train_override).expanduser().resolve()
         dev_in = raw_root / "val_v2_call_bioLLM.json"
         test_in = raw_root / "test_v2_call_bioLLM.json"
         if all(path.exists() for path in (dev_in, test_in)):
             effective_train_in = train_in
             if not _looks_like_complete_json_array(train_in):
-                print(
-                    "[warn] primekgqa train_v2_call_bioLLM.json looks truncated; "
-                    "falling back to val_v2_call_bioLLM.json for train/dev and test_v2_call_bioLLM.json for test"
-                )
-                effective_train_in = dev_in
+                salvaged_train = raw_root / "train_v2_call_bioLLM.salvaged.jsonl"
+                salvaged_count = _salvage_json_array_to_jsonl(train_in, salvaged_train)
+                if salvaged_count > 0:
+                    print(
+                        f"[prepare] primekgqa truncated train recovered: {salvaged_count} complete records -> {salvaged_train}"
+                    )
+                    effective_train_in = salvaged_train
+                else:
+                    print(
+                        "[warn] primekgqa train_v2_call_bioLLM.json looks truncated and could not be recovered; "
+                        "falling back to val_v2_call_bioLLM.json for train/dev and test_v2_call_bioLLM.json for test"
+                    )
+                    effective_train_in = dev_in
             return [
                 PYTHON_BIN,
                 "scripts/prepare_medical_kgqa.py",
@@ -994,8 +1104,30 @@ def _downloaded_medical_converter_cmd(dataset: str) -> Optional[List[str]]:
     return None
 
 
+def _maybe_build_medhop_entity_names(args: argparse.Namespace, dataset: str) -> bool:
+    if dataset != "medhopqa":
+        return False
+    target = REPO_ROOT / "data" / "medhopqa" / "entity_names.json"
+    if target.exists():
+        return False
+    raw_root = REPO_ROOT / "data" / "medhopqa_raw"
+    if not (raw_root / "train.jsonl").exists():
+        return False
+    cmd = [
+        PYTHON_BIN,
+        "scripts/build_medhopqa_entity_names.py",
+        "--raw-dir",
+        str(raw_root),
+        "--out-json",
+        str(target),
+    ]
+    print("[prepare] build MedHopQA entity_names.json from DrugBank/UniProt IDs")
+    _run_simple(cmd, dry_run=args.dry_run)
+    return True
+
+
 def _maybe_auto_convert_downloaded_medical_data(args: argparse.Namespace, dataset: str) -> bool:
-    cmd = _downloaded_medical_converter_cmd(dataset)
+    cmd = _downloaded_medical_converter_cmd(args, dataset)
     if cmd is None:
         return False
     print(f"[prepare] auto-convert downloaded raw {dataset} -> data/{dataset}")
@@ -1023,7 +1155,7 @@ def _ensure_raw_inputs(args: argparse.Namespace, dataset: str) -> List[Path]:
         if args.hf_cache_dir:
             cmd.extend(["--cache_dir", args.hf_cache_dir])
         _run_simple(cmd, dry_run=args.dry_run)
-    elif dataset not in BUILTIN_HF_DATASETS and not raw_ready:
+    elif dataset not in BUILTIN_HF_DATASETS and (args.force_prepare or not raw_ready):
         auto_converted = _maybe_auto_convert_downloaded_medical_data(args, dataset)
         if auto_converted:
             if args.dry_run:
@@ -1046,6 +1178,7 @@ def _ensure_raw_inputs(args: argparse.Namespace, dataset: str) -> List[Path]:
 
 def _run_preprocess_stage(args: argparse.Namespace, dataset: str) -> None:
     _ensure_raw_inputs(args, dataset)
+    _maybe_build_medhop_entity_names(args, dataset)
     processed_paths = _ensure_processed_ready(dataset)
     processed_ready = all(path.exists() for path in processed_paths)
     common_prepare = _prepare_common_overrides(args)
@@ -1119,8 +1252,9 @@ def _train(args: argparse.Namespace, dataset: str, emb_dir: Path) -> Tuple[Path,
         _check_paths(_ensure_emb_ready(emb_dir), f"{dataset} embeddings")
 
     run_root = REPO_ROOT / "logs" / "r6i5" / f"{dataset}_{args.variant}_{args.run_tag}"
-    phase1_ckpt_dir = REPO_ROOT / "trm_agent" / "ckpt" / f"{dataset}_{args.model_impl}_rearev_D_phase1_{args.run_tag}"
-    phase2_ckpt_dir = REPO_ROOT / "trm_agent" / "ckpt" / f"{dataset}_{args.model_impl}_rearev_D_phase2_{args.run_tag}"
+    variant_tag = _variant_path_tag(args.variant)
+    phase1_ckpt_dir = REPO_ROOT / "trm_agent" / "ckpt" / f"{dataset}_{args.model_impl}_rearev_{variant_tag}_phase1_{args.run_tag}"
+    phase2_ckpt_dir = REPO_ROOT / "trm_agent" / "ckpt" / f"{dataset}_{args.model_impl}_rearev_{variant_tag}_phase2_{args.run_tag}"
     phase1_ckpt_dir.mkdir(parents=True, exist_ok=True)
     phase2_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1208,9 +1342,14 @@ def _train(args: argparse.Namespace, dataset: str, emb_dir: Path) -> Tuple[Path,
 
 def _test_best(args: argparse.Namespace, dataset: str, emb_dir: Path) -> Path:
     if args.dry_run and not args.ckpt_dir:
-        phase2_dir = REPO_ROOT / "trm_agent" / "ckpt" / f"{dataset}_{args.model_impl}_rearev_D_phase2_{args.run_tag}"
+        phase2_dir = (
+            REPO_ROOT
+            / "trm_agent"
+            / "ckpt"
+            / f"{dataset}_{args.model_impl}_rearev_{_variant_path_tag(args.variant)}_phase2_{args.run_tag}"
+        )
     else:
-        phase2_dir = Path(args.ckpt_dir) if args.ckpt_dir else _latest_phase2_dir(dataset)
+        phase2_dir = Path(args.ckpt_dir) if args.ckpt_dir else _latest_phase2_dir(dataset, args.variant)
     metric = args.metric.lower()
     if metric in {"hit1", "dev_hit1"}:
         metric = "dev_hit1"
@@ -1246,6 +1385,124 @@ def _test_best(args: argparse.Namespace, dataset: str, emb_dir: Path) -> Path:
     return ckpt_path
 
 
+def _parse_test_metrics(log_path: Path) -> Optional[Dict[str, float]]:
+    if not log_path.exists():
+        return None
+    text = _read_text_safe(log_path)
+    matches = TEST_SUBGRAPH_PAT.findall(text)
+    if not matches:
+        return None
+    hit1, f1, precision, recall, skip = matches[-1]
+    return {
+        "hit1": float(hit1),
+        "f1": float(f1),
+        "precision": float(precision),
+        "recall": float(recall),
+        "skip": float(skip),
+    }
+
+
+def _test_range(args: argparse.Namespace, dataset: str, emb_dir: Path) -> Tuple[Path, List[Dict[str, float]]]:
+    if args.dry_run and not args.ckpt_dir:
+        phase2_dir = (
+            REPO_ROOT
+            / "trm_agent"
+            / "ckpt"
+            / f"{dataset}_{args.model_impl}_rearev_{_variant_path_tag(args.variant)}_phase2_{args.run_tag}"
+        )
+    else:
+        phase2_dir = Path(args.ckpt_dir) if args.ckpt_dir else _latest_phase2_dir(dataset, args.variant)
+
+    epoch_start = int(args.epoch_start)
+    epoch_end = int(args.epoch_end)
+    if epoch_end < epoch_start:
+        raise ValueError(f"epoch_end({epoch_end}) must be >= epoch_start({epoch_start})")
+
+    range_metric = str(args.range_metric or "hit1").strip().lower()
+    if range_metric not in {"hit1", "f1"}:
+        raise ValueError(f"Unsupported --range-metric={args.range_metric!r}. allowed=['hit1','f1']")
+
+    run_root = REPO_ROOT / "logs" / "r6i5" / f"{dataset}_{args.variant}_{args.run_tag}" / "test_range"
+    run_root.mkdir(parents=True, exist_ok=True)
+    metric = args.metric.lower()
+    if metric in {"hit1", "dev_hit1"}:
+        metric = "dev_hit1"
+    elif metric in {"f1", "dev_f1"}:
+        metric = "dev_f1"
+    else:
+        raise ValueError(f"Unsupported metric: {args.metric}")
+
+    rows: List[Dict[str, float]] = []
+    best_row: Optional[Dict[str, float]] = None
+    best_ckpt: Optional[Path] = None
+
+    for epoch in range(epoch_start, epoch_end + 1):
+        ckpt_path = phase2_dir / f"model_ep{epoch}.pt"
+        if not ckpt_path.exists():
+            print(f"[test-range] skip missing checkpoint: {ckpt_path}")
+            continue
+        test_cmd = _build_test_command(
+            dataset=dataset,
+            model_impl=args.model_impl,
+            ckpt=str(ckpt_path),
+            overrides=_test_overrides(args=args, dataset=dataset, emb_dir=emb_dir, metric=metric),
+        )
+        log_path = run_root / f"test_ep{epoch}.log"
+        rc = _run_with_tee(
+            test_cmd,
+            env_overrides=_wandb_env(),
+            log_path=log_path,
+            dry_run=args.dry_run,
+        )
+        if args.dry_run:
+            continue
+        if rc != 0:
+            raise RuntimeError(f"Test failed for checkpoint: {ckpt_path}")
+        metrics = _parse_test_metrics(log_path)
+        if metrics is None:
+            raise RuntimeError(f"Could not parse test metrics from log: {log_path}")
+        row = {"epoch": float(epoch), **metrics}
+        rows.append(row)
+        print(
+            "[test-range] "
+            f"ep={epoch} hit1={metrics['hit1']:.4f} f1={metrics['f1']:.4f} "
+            f"precision={metrics['precision']:.4f} recall={metrics['recall']:.4f}"
+        )
+        if (
+            best_row is None
+            or row[range_metric] > best_row[range_metric]
+            or (row[range_metric] == best_row[range_metric] and row["epoch"] > best_row["epoch"])
+        ):
+            best_row = row
+            best_ckpt = ckpt_path
+
+    if args.dry_run:
+        return phase2_dir / f"model_ep{epoch_start}.pt", rows
+
+    if best_row is None or best_ckpt is None:
+        raise FileNotFoundError(
+            f"No checkpoints found in {phase2_dir} for epoch range [{epoch_start}, {epoch_end}]"
+        )
+
+    summary_path = run_root / f"summary_ep{epoch_start}_to_ep{epoch_end}.json"
+    summary = {
+        "dataset": dataset,
+        "variant": args.variant,
+        "phase2_dir": str(phase2_dir),
+        "metric": range_metric,
+        "best_ckpt": str(best_ckpt),
+        "best_epoch": int(best_row["epoch"]),
+        "rows": rows,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(
+        f"[test-range] best by test_{range_metric}: ep={int(best_row['epoch'])} "
+        f"hit1={best_row['hit1']:.4f} f1={best_row['f1']:.4f} ckpt={best_ckpt}"
+    )
+    print(f"[test-range] summary saved: {summary_path}")
+    return best_ckpt, rows
+
+
 def _parse_args() -> argparse.Namespace:
     default_nproc = _default_nproc()
     default_fallback_nproc = _default_fallback_nproc(default_nproc)
@@ -1254,7 +1511,7 @@ def _parse_args() -> argparse.Namespace:
 
     ap = argparse.ArgumentParser(description="Windows-friendly recursive ReaRev launcher for CWQ/WebQSP/custom KGQA")
     ap.add_argument("--dataset", choices=list(SUPPORTED_LAUNCHER_DATASETS), required=True)
-    ap.add_argument("--mode", choices=["preprocess", "embed", "prepare", "train", "all", "test-best"], default="all")
+    ap.add_argument("--mode", choices=["preprocess", "embed", "prepare", "train", "all", "test-best", "test-range"], default="all")
     ap.add_argument("--variant", choices=["d", "dplus"], default="d")
     ap.add_argument("--model-impl", choices=["trm", "trm_hier6"], default="trm_hier6")
     ap.add_argument("--run-tag", default="")
@@ -1279,7 +1536,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--embed-auto-batch-min", type=int, default=4)
     ap.add_argument("--embed-auto-batch-max", type=int, default=512)
     ap.add_argument("--embed-auto-batch-vram-frac", type=float, default=0.85)
-    ap.add_argument("--entity-names-json", default="data/data/entities_names.json")
+    ap.add_argument("--entity-names-json", default="")
+    ap.add_argument("--primekgqa-train-override", default="")
 
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--force-prepare", action="store_true")
@@ -1319,6 +1577,9 @@ def _parse_args() -> argparse.Namespace:
 
     ap.add_argument("--metric", default="dev_f1", help="Used only with --mode test-best")
     ap.add_argument("--ckpt-dir", default="", help="Optional phase2 checkpoint directory for --mode test-best")
+    ap.add_argument("--epoch-start", type=int, default=20, help="Used only with --mode test-range")
+    ap.add_argument("--epoch-end", type=int, default=26, help="Used only with --mode test-range")
+    ap.add_argument("--range-metric", default="hit1", help="Used only with --mode test-range: hit1 or f1")
     return ap.parse_args()
 
 
@@ -1331,6 +1592,8 @@ def main() -> None:
         args.embed_style = _default_embed_style(args.dataset)
     if not str(args.embed_backend).strip():
         args.embed_backend = _default_embed_backend(args.dataset)
+    if not str(args.entity_names_json).strip():
+        args.entity_names_json = _default_entity_names_json(args.dataset)
     if not str(args.run_tag).strip():
         args.run_tag = f"{_recipe_display_name(args.recursion_steps, args.instructions)}_{_timestamp()}"
     original_preprocess_workers = int(args.preprocess_workers)
@@ -1357,6 +1620,10 @@ def main() -> None:
     if args.mode == "test-best":
         ckpt_path = _test_best(args, args.dataset, emb_dir)
         print(f"[test] evaluated checkpoint: {ckpt_path}")
+
+    if args.mode == "test-range":
+        best_ckpt, _ = _test_range(args, args.dataset, emb_dir)
+        print(f"[test-range] selected checkpoint: {best_ckpt}")
 
 
 if __name__ == "__main__":

@@ -514,10 +514,15 @@ def build_embeddings(
             # Match GNN-RAG style as closely as possible.
             embed_backend = "sentence_transformers"
     else:
-        ent_texts = read_text_lines(entities_txt, mode='entity')
-        rel_texts = read_text_lines(relations_txt, mode='relation')
         ent_ids = load_id_list(entities_txt)
         rel_ids = load_id_list(relations_txt)
+        name_map = load_entity_name_map(entity_names_json)
+        if name_map:
+            raw_ent_texts = read_text_lines(entities_txt, mode='entity')
+            ent_texts = [name_map.get(eid, raw_ent_texts[idx]) for idx, eid in enumerate(ent_ids)]
+        else:
+            ent_texts = read_text_lines(entities_txt, mode='entity')
+        rel_texts = read_text_lines(relations_txt, mode='relation')
 
     q_train, q_train_ids = collect_questions_and_ids(train_jsonl)
     q_dev, q_dev_ids = collect_questions_and_ids(dev_jsonl)

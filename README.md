@@ -23,6 +23,28 @@ This repo is maintained for two subgraph-reader variants:
 
 For PowerShell / Windows-friendly runs, use the Python launcher instead of the Bash wrappers.
 
+### Windows Download Wrappers
+
+If you want GitHub-downloadable Windows entrypoints while keeping the original Bash scripts untouched, use the wrappers under `scripts/`.
+
+PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/download_cwq_hf.ps1
+powershell -ExecutionPolicy Bypass -File scripts/download_cwq_vocab_only.ps1
+powershell -ExecutionPolicy Bypass -File scripts/download_data.ps1 -Dataset webqsp
+```
+
+`cmd.exe`:
+
+```bat
+scripts\download_cwq_hf.cmd
+scripts\download_cwq_vocab_only.cmd
+scripts\download_data.cmd -Dataset webqsp
+```
+
+These wrappers call the same underlying Python preparation path as the Bash scripts, so Linux users can keep using `.sh` while Windows users can run `.ps1` or `.cmd` directly.
+
 1. Prepare CWQ data + preprocess + embeddings.
 
 ```powershell
@@ -176,4 +198,81 @@ Resume only unfinished cycles:
 ```bash
 cd <repo-root>
 bash trm_rag_style/scripts/run_rearev_d_dplus_ablation_remaining.sh
+```
+
+## GitHub Sync
+
+Code changes can be committed and pushed normally, but dataset and embedding artifacts are local outputs and are not meant to go to GitHub.
+
+These paths are usually local-only:
+
+- `data/`
+- `trm_agent/processed/`
+- `trm_agent/emb/`
+- `wandb/`
+- `logs/`
+
+If you want another machine to reuse prepared medical/CWQ/WebQSP artifacts, copy those directories separately instead of expecting them to appear from `git pull`.
+
+### PowerShell / Windows
+
+Check what changed:
+
+```powershell
+git status --short
+```
+
+Stage only code and docs:
+
+```powershell
+git add README.md
+git add scripts
+git add trm_rag_style/configs
+git add trm_unified
+```
+
+Commit:
+
+```powershell
+git commit -m "Add Windows wrappers and medical KGQA updates"
+```
+
+Push:
+
+```powershell
+git push origin main
+```
+
+If you also need to copy prepared data or embeddings to another server, use a separate transfer step such as `scp`, `rsync`, or SFTP.
+
+### cmd.exe
+
+```bat
+git status --short
+git add README.md scripts trm_rag_style\configs trm_unified
+git commit -m "Add Windows wrappers and medical KGQA updates"
+git push origin main
+```
+
+### Linux
+
+```bash
+git status --short
+git add README.md scripts trm_rag_style/configs trm_unified
+git commit -m "Add Windows wrappers and medical KGQA updates"
+git push origin main
+```
+
+### Sanity Check Before Push
+
+If you changed launcher logic, it is a good idea to run at least a quick syntax check before pushing:
+
+```powershell
+python -m py_compile scripts/run_rearev_r6i5.py
+```
+
+or on Linux:
+
+```bash
+python -m py_compile scripts/run_rearev_r6i5.py
 ```

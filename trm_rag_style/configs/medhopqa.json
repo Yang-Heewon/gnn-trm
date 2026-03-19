@@ -4,7 +4,7 @@
   "test_in": "data/medhopqa/test.jsonl",
   "entities_txt": "data/medhopqa/entities.txt",
   "relations_txt": "data/medhopqa/relations.txt",
-  "entity_names_json": "",
+  "entity_names_json": "data/medhopqa/entity_names.json",
   "custom_link_mode": "copy",
   "custom_train_jsonl": "data/medhopqa/train.jsonl",
   "custom_dev_jsonl": "data/medhopqa/dev.jsonl",
